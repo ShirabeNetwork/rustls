@@ -195,6 +195,9 @@ impl EchConfig {
 pub struct EchGreaseConfig {
     pub(crate) suite: &'static dyn Hpke,
     pub(crate) placeholder_key: HpkePublicKey,
+    /// Kirika fork (P8): size the payload as BoringSSL / Chrome do instead of
+    /// like a real inner hello. Set only by `DangerousClientConfig::set_ech_grease`.
+    pub(crate) browser_payload_length: bool,
 }
 
 impl EchGreaseConfig {
@@ -211,6 +214,7 @@ impl EchGreaseConfig {
         Self {
             suite,
             placeholder_key,
+            browser_payload_length: false,
         }
     }
 
@@ -255,19 +259,28 @@ impl EchGreaseConfig {
             false, // Does not matter if we enable/disable SNI here. Inner hello is not used.
         )?;
 
-        // Construct an inner hello using the outer hello - this allows us to know the size of
-        // dummy payload we should use for the GREASE extension.
-        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None);
+        let tag_len = suite
+            .sym
+            .aead_id
+            .tag_len()
+            // Safety: we have confirmed the AEAD is supported when building the config. All
+            //  supported AEADs have a tag length.
+            .unwrap();
+        let payload_len = if self.browser_payload_length {
+            // Kirika fork (P8): BoringSSL's `setup_ech_grease`: 32 * [4, 7] bytes of
+            // "inner hello" plus the AEAD overhead (144 / 176 / 208 / 240 with
+            // AES-128-GCM), uniform per connection (256 is a multiple of 4).
+            let mut r = [0u8; 1];
+            secure_random.fill(&mut r)?;
+            32 * (4 + usize::from(r[0] % 4)) + tag_len
+        } else {
+            // Construct an inner hello using the outer hello - this allows us to know the size of
+            // dummy payload we should use for the GREASE extension.
+            let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None);
 
-        // Generate a payload of random data equivalent in length to a real inner hello.
-        let payload_len = encoded_inner_hello.len()
-            + suite
-                .sym
-                .aead_id
-                .tag_len()
-                // Safety: we have confirmed the AEAD is supported when building the config. All
-                //  supported AEADs have a tag length.
-                .unwrap();
+            // Generate a payload of random data equivalent in length to a real inner hello.
+            encoded_inner_hello.len() + tag_len
+        };
         let mut payload = vec![0; payload_len];
         secure_random.fill(&mut payload)?;
 

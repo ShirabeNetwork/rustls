@@ -1901,4 +1901,92 @@ mod tls12 {
         );
         assert_eq!(customizer.sent.lock().unwrap().len(), 1);
     }
+
+    // P8: GREASE ECH payload sized as BoringSSL / Chrome do.
+
+    /// The payload length of an outer ECH extension body (type, KDF, AEAD,
+    /// config id, enc, payload).
+    fn ech_payload_len(body: &[u8]) -> usize {
+        assert_eq!(body[0], 0, "outer");
+        let enc = usize::from(u16::from_be_bytes([body[6], body[7]]));
+        let at = 8 + enc;
+        let len = usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+        assert_eq!(body.len(), at + 2 + len);
+        len
+    }
+
+    const CHROME_GREASE_LENGTHS: [usize; 4] = [144, 176, 208, 240];
+
+    #[test]
+    fn ech_grease_payload_length_follows_boringssl() {
+        let (config, customizer) = client12_ech_grease(KeyType::EcdsaP256);
+        let config = Arc::new(config);
+        let mut seen = [0usize; 4];
+        for i in 0..400 {
+            // Server names of different lengths: the size must not follow them.
+            let name = format!("{}.example", "a".repeat(1 + i % 40));
+            let mut client =
+                ClientConnection::new(config.clone(), ServerName::try_from(name).unwrap()).unwrap();
+            first_flight(&mut client);
+        }
+        for sent in customizer.sent.lock().unwrap().iter() {
+            let len = ech_payload_len(Hello::parse(sent).ext(EXT_ECH).unwrap());
+            let k = CHROME_GREASE_LENGTHS
+                .iter()
+                .position(|&l| l == len)
+                .unwrap_or_else(|| panic!("GREASE payload length {len}"));
+            seen[k] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 0), "every length occurs: {seen:?}");
+    }
+
+    #[test]
+    fn ech_grease_browser_length_survives_hello_retry_and_handshakes() {
+        for _ in 0..8 {
+            let (config, customizer) = client12_ech_grease(KeyType::EcdsaP256);
+            let mut client =
+                ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+            let mut server = ServerConnection::new(Arc::new(server12(
+                KeyType::EcdsaP256,
+                &TLS13,
+                provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                provider::kx_group::SECP256R1,
+                Server12::default(),
+            )))
+            .unwrap();
+            do_handshake(&mut client, &mut server);
+            assert_eq!(client.ech_status(), EchStatus::Grease);
+            round_trip(&mut client, &mut server);
+            let sent = customizer.sent.lock().unwrap().clone();
+            assert_eq!(sent.len(), 2);
+            let ech: Vec<Vec<u8>> = sent
+                .iter()
+                .map(|s| {
+                    Hello::parse(s)
+                        .ext(EXT_ECH)
+                        .cloned()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(ech[0], ech[1], "CH2 repeats the GREASE extension");
+            assert!(CHROME_GREASE_LENGTHS.contains(&ech_payload_len(&ech[0])));
+        }
+    }
+
+    #[test]
+    fn builder_ech_grease_keeps_the_upstream_length() {
+        // Upstream behaviour unchanged: `with_ech(EchMode::Grease)` sizes the
+        // payload like a real inner hello (here with an X25519MLKEM768 share,
+        // far above 240 bytes).
+        let suite = ALL_SUPPORTED_SUITES[0];
+        let (public_key, _) = suite.generate_key_pair().unwrap();
+        let builder = ClientConfig::builder_with_provider(kx_provider(default_client_kx()).into())
+            .with_ech(EchMode::Grease(EchGreaseConfig::new(suite, public_key)))
+            .unwrap();
+        let config = finish_client_config(KeyType::EcdsaP256, builder);
+        let mut client = ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+        let rec = first_flight(&mut client);
+        let len = ech_payload_len(Hello::parse(&rec).ext(EXT_ECH).unwrap());
+        assert!(len > 240, "{len}");
+    }
 }

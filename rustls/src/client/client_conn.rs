@@ -612,8 +612,15 @@ pub(super) mod danger {
         ///
         /// [`ConfigBuilder::with_ech`]: crate::ConfigBuilder::with_ech
         /// [`EchMode::Grease`]: crate::client::EchMode::Grease
+        ///
+        /// The GREASE payload is sized as BoringSSL / Chrome size it (fork patch
+        /// P8): 32 × a random 4..=7 bytes plus the AEAD tag (144, 176, 208 or 240
+        /// bytes with AES-128-GCM), not like a real inner hello as with
+        /// [`EchMode::Grease`] through the builder.
+        ///
         /// [`EchMode::Enable`]: crate::client::EchMode::Enable
-        pub fn set_ech_grease(&mut self, grease: crate::client::EchGreaseConfig) {
+        pub fn set_ech_grease(&mut self, mut grease: crate::client::EchGreaseConfig) {
+            grease.browser_payload_length = true;
             self.cfg.ech_mode = Some(crate::client::EchMode::Grease(grease));
         }
     }

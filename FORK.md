@@ -139,6 +139,20 @@ the builder did not. GREASE carries no key material; a TLS 1.2 server ignores
 the extension, and the TLS 1.2 handshake does not look at the ECH state. Real
 ECH (`EchMode::Enable`) is unchanged: TLS 1.3 only, through `with_ech`.
 
+### P8 GREASE ECH payload length as in BoringSSL / Chrome
+
+With `set_ech_grease` (P7), the GREASE payload is `32 * r + tag` bytes with `r`
+drawn uniformly from 4..=7 per connection from the provider's `SecureRandom`
+(BoringSSL `setup_ech_grease`; 144 / 176 / 208 / 240 bytes with AES-128-GCM),
+instead of the length of a real inner hello. Upstream rustls sizes GREASE like
+the encoded inner hello, which for a hello with an X25519MLKEM768 share is a
+constant ~400 bytes: a customized Chrome-shaped hello was then ~225 bytes
+larger than Chrome's and easy to tell apart by length. Only the
+`set_ech_grease` path changes (a flag on `EchGreaseConfig` that only that
+setter sets); `ConfigBuilder::with_ech(EchMode::Grease(..))` keeps upstream's
+sizing. The extension is still generated once per connection and repeated
+verbatim in the second hello after a HelloRetryRequest.
+
 ## P1 invariants
 
 The customized hello is accepted only if:
@@ -180,7 +194,7 @@ everything else Chrome sends for TLS 1.2 comes from the customizer.
 git fetch upstream --tags
 git switch kirika/0.23.46
 git switch -c kirika/0.23.NN
-git rebase --onto v/0.23.NN v/0.23.46     # replays P1..P7
+git rebase --onto v/0.23.NN v/0.23.46     # replays P1..P8
 # resolve conflicts patch by patch (grep "Kirika fork"), then:
 cargo fmt -p rustls
 cargo clippy -j 4 -p rustls --all-targets -- -D warnings -A clippy::nonminimal_bool
@@ -220,7 +234,11 @@ must be followed. A move to 0.24 is a separate project.
   ServerKeyExchange group dropped from the sent hello; `UnbufferedClientConnection`
   handshakes and round trips for TLS 1.2 and TLS 1.3; GREASE ECH with TLS 1.2
   enabled (P7): TLS 1.2 handshakes for each suite, TLS 1.3 with a
-  HelloRetryRequest (same GREASE extension in both hellos), unbuffered TLS 1.2.
+  HelloRetryRequest (same GREASE extension in both hellos), unbuffered TLS 1.2;
+  P8: over 400 hellos (server names of 1–40 characters) every GREASE payload is
+  144 / 176 / 208 / 240 bytes and all four occur; with HelloRetryRequests the
+  browser-sized extension is repeated verbatim and the handshakes complete; the
+  builder's GREASE keeps upstream's inner-hello sizing.
 - `rustls/src/client/fork_test.rs` (unit, `aws_lc_rs`): scripted TLS 1.3 server
   (secrets from the client's key log) for ALPS (client EncryptedExtensions bytes,
   server and client Finished over the transcript including both, unsolicited
