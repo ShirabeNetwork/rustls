@@ -479,8 +479,9 @@ fn validate_encrypted_extensions(
     common: &mut CommonState,
     hello: &ClientHelloDetails,
     exts: &ServerExtensions<'_>,
+    allowed_unsolicited: &[ExtensionType],
 ) -> Result<(), Error> {
-    if hello.server_sent_unsolicited_extensions(exts, &[]) {
+    if hello.server_sent_unsolicited_extensions(exts, allowed_unsolicited) {
         return Err(common.send_fatal_alert(
             AlertDescription::UnsupportedExtension,
             PeerMisbehaved::UnsolicitedEncryptedExtension,
@@ -526,7 +527,14 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         debug!("TLS1.3 encrypted extensions: {exts:?}");
         self.transcript.add_message(&m);
 
-        validate_encrypted_extensions(cx.common, &self.hello, exts)?;
+        // Kirika fork P3: ALPS answered for the negotiated protocol, if offered.
+        let alps = super::alps::negotiated(&self.hello.offered_alps, exts);
+        let allowed: &[ExtensionType] = match &alps {
+            Some(alps) => core::slice::from_ref(alps),
+            None => &[],
+        };
+        validate_encrypted_extensions(cx.common, &self.hello, exts, allowed)?;
+        cx.data.sent_hello.alps = alps;
         hs::process_alpn_protocol(
             cx.common,
             &self.hello.alpn_protocols,
@@ -1420,6 +1428,11 @@ impl State<ClientConnectionData> for ExpectFinished {
         }
 
         let mut flight = HandshakeFlightTls13::new(&mut st.transcript);
+
+        // Kirika fork P3: client EncryptedExtensions with empty ALPS settings.
+        if let Some(alps) = cx.data.sent_hello.alps {
+            flight.add_encoded(&super::alps::client_encrypted_extensions(alps));
+        }
 
         /* Send our authentication/finished messages.  These are still encrypted
          * with our handshake keys. */

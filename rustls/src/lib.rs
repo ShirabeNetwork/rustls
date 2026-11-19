@@ -580,11 +580,14 @@ pub use crate::webpki::RootCertStore;
 
 /// Items for use in a client.
 pub mod client {
+    mod alps;
     pub(super) mod builder;
     mod client_conn;
     mod common;
     mod customize;
     mod ech;
+    #[cfg(test)]
+    mod fork_test;
     pub(super) mod handy;
     mod hs;
     #[cfg(test)]

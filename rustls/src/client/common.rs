@@ -46,6 +46,8 @@ pub(super) struct ClientHelloDetails {
     pub(super) offered_groups: Vec<NamedGroup>,
     /// Non-GREASE groups of the sent key shares (Kirika fork).
     pub(super) sent_key_share_groups: Vec<NamedGroup>,
+    /// ALPS extensions offered (Kirika fork P3).
+    pub(super) offered_alps: Vec<super::alps::OfferedAlps>,
 }
 
 impl ClientHelloDetails {
@@ -58,6 +60,7 @@ impl ClientHelloDetails {
             offered_cipher_suites: Vec::new(),
             offered_groups: Vec::new(),
             sent_key_share_groups: Vec::new(),
+            offered_alps: Vec::new(),
         }
     }
 
@@ -66,7 +69,13 @@ impl ClientHelloDetails {
     /// `ch` is the hello as sent, which differs from the one rustls built
     /// when a `ClientHelloCustomizer` is set.  Extensions rustls cannot parse
     /// are not recorded as offered.
-    pub(super) fn record_sent(&mut self, ch: &ClientHelloPayload, facts: &mut SentHelloFacts) {
+    pub(super) fn record_sent(
+        &mut self,
+        ch: &ClientHelloPayload,
+        encoded: &[u8],
+        facts: &mut SentHelloFacts,
+    ) {
+        self.offered_alps = super::alps::offered(encoded);
         let not_grease = |g: &NamedGroup| !super::customize::is_grease(u16::from(*g));
         self.sent_extensions = ch.collect_used();
         self.offered_cipher_suites = ch.cipher_suites.clone();
@@ -123,6 +132,8 @@ impl ClientHelloDetails {
 pub(super) struct SentHelloFacts {
     /// Offered certificate compression algorithms.
     pub(super) cert_compression_algs: Vec<CertificateCompressionAlgorithm>,
+    /// ALPS codepoint the server answered in EncryptedExtensions (P3).
+    pub(super) alps: Option<ExtensionType>,
 }
 
 pub(super) enum ClientAuthDetails {

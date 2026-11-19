@@ -576,12 +576,12 @@ fn emit_client_hello_for_retry(
     };
     if let MessagePayload::Handshake {
         parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(sent)),
-        ..
+        encoded,
     } = &ch.payload
     {
         input
             .hello
-            .record_sent(sent, &mut cx.data.sent_hello);
+            .record_sent(sent, encoded.bytes(), &mut cx.data.sent_hello);
     }
 
     if retryreq.is_some() {

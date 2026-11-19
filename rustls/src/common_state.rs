@@ -1114,6 +1114,12 @@ impl<'a, const TLS13: bool> HandshakeFlight<'a, TLS13> {
             .add(&self.body[start_len..]);
     }
 
+    /// Add an already encoded handshake message (Kirika fork).
+    pub(crate) fn add_encoded(&mut self, encoded: &[u8]) {
+        self.transcript.add(encoded);
+        self.body.extend_from_slice(encoded);
+    }
+
     pub(crate) fn finish(self, common: &mut CommonState) {
         common.send_msg(
             Message {
