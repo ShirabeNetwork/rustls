@@ -597,6 +597,25 @@ pub(super) mod danger {
             self.cfg.resumption = super::Resumption::disabled();
             self.cfg.enable_early_data = false;
         }
+
+        /// Sends a GREASE `encrypted_client_hello` extension (RFC 9849
+        /// section 6.2) without limiting the protocol versions (Kirika fork).
+        ///
+        /// [`ConfigBuilder::with_ech`] with [`EchMode::Grease`] also restricts
+        /// the configuration to TLS 1.3.  Browsers send GREASE ECH in a hello
+        /// that still offers TLS 1.2; this keeps whatever versions the
+        /// configuration enables.  GREASE carries no key material: a TLS 1.3
+        /// server ignores it (and may send retry configs, which are ignored),
+        /// a TLS 1.2 server ignores the extension.  Real ECH ([`EchMode::Enable`])
+        /// still requires TLS 1.3 only and must be configured with
+        /// [`ConfigBuilder::with_ech`].  Replaces any ECH mode set before.
+        ///
+        /// [`ConfigBuilder::with_ech`]: crate::ConfigBuilder::with_ech
+        /// [`EchMode::Grease`]: crate::client::EchMode::Grease
+        /// [`EchMode::Enable`]: crate::client::EchMode::Enable
+        pub fn set_ech_grease(&mut self, grease: crate::client::EchGreaseConfig) {
+            self.cfg.ech_mode = Some(crate::client::EchMode::Grease(grease));
+        }
     }
 }
 

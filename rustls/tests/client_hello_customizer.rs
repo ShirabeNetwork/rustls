@@ -1809,4 +1809,96 @@ mod tls12 {
         );
         assert_eq!(customizer.sent.lock().unwrap().len(), 1);
     }
+
+    // P7: GREASE ECH without limiting the versions.
+
+    fn client12_ech_grease(kt: KeyType) -> (ClientConfig, Arc<Chrome12Customizer>) {
+        let (mut config, customizer) = client12(kt, Chrome12::default());
+        let suite = ALL_SUPPORTED_SUITES[0];
+        let (public_key, _) = suite.generate_key_pair().unwrap();
+        config
+            .dangerous()
+            .set_ech_grease(EchGreaseConfig::new(suite, public_key));
+        (config, customizer)
+    }
+
+    #[test]
+    fn ech_grease_keeps_tls12() {
+        for (suite, kt) in tls12_suites() {
+            let (config, customizer) = client12_ech_grease(kt);
+            let mut client =
+                ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+            let mut server = ServerConnection::new(Arc::new(server12(
+                kt,
+                &TLS12,
+                suite,
+                provider::kx_group::X25519,
+                Server12::default(),
+            )))
+            .unwrap();
+            do_handshake(&mut client, &mut server);
+            assert_eq!(client.protocol_version(), Some(ProtocolVersion::TLSv1_2));
+            assert_eq!(client.negotiated_cipher_suite(), Some(suite));
+            assert_eq!(client.ech_status(), EchStatus::Grease);
+            round_trip(&mut client, &mut server);
+            let sent = customizer.sent.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1);
+            let sent = Hello::parse(&sent[0]);
+            assert!(sent.ext(EXT_ECH).is_some());
+            assert_eq!(
+                &sent
+                    .ext(EXT_SUPPORTED_VERSIONS)
+                    .unwrap()[1..],
+                &[0x2a, 0x2a, 0x03, 0x04, 0x03, 0x03]
+            );
+        }
+    }
+
+    #[test]
+    fn ech_grease_with_tls12_enabled_negotiates_tls13() {
+        let (config, customizer) = client12_ech_grease(KeyType::EcdsaP256);
+        let mut client = ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+        // secp256r1 only: a HelloRetryRequest, both hellos with the same GREASE.
+        let mut server = ServerConnection::new(Arc::new(server12(
+            KeyType::EcdsaP256,
+            &TLS13,
+            provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            provider::kx_group::SECP256R1,
+            Server12::default(),
+        )))
+        .unwrap();
+        do_handshake(&mut client, &mut server);
+        assert_eq!(client.protocol_version(), Some(ProtocolVersion::TLSv1_3));
+        assert_eq!(client.ech_status(), EchStatus::Grease);
+        round_trip(&mut client, &mut server);
+        let sent = customizer.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        let ech: Vec<_> = sent
+            .iter()
+            .map(|s| {
+                Hello::parse(s)
+                    .ext(EXT_ECH)
+                    .cloned()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ech[0], ech[1]);
+    }
+
+    #[test]
+    fn unbuffered_tls12_with_ech_grease() {
+        let (config, customizer) = client12_ech_grease(KeyType::EcdsaP256);
+        unbuffered_round_trip(
+            config,
+            server12(
+                KeyType::EcdsaP256,
+                &TLS12,
+                provider::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                provider::kx_group::X25519,
+                Server12::default(),
+            ),
+            ProtocolVersion::TLSv1_2,
+        );
+        assert_eq!(customizer.sent.lock().unwrap().len(), 1);
+    }
 }

@@ -127,6 +127,18 @@ resumption; a stapled OCSP response is handed to the verifier). The connection
 uses rustls' own TLS 1.2 record layer, also through the unbuffered API; no
 secret extraction is involved.
 
+### P7 GREASE ECH with TLS 1.2 enabled
+
+`DangerousClientConfig::set_ech_grease(EchGreaseConfig)` sets `EchMode::Grease`
+without touching the enabled protocol versions. Upstream's
+`ConfigBuilder::with_ech(EchMode::Grease(..))` also restricts the config to
+TLS 1.3, so a browser-shaped hello could not carry GREASE ECH and offer TLS 1.2
+at the same time (browsers do both). The handshake code already allowed it
+(`emit_client_hello_for_retry` forbids TLS 1.2 only for a real ECH state); only
+the builder did not. GREASE carries no key material; a TLS 1.2 server ignores
+the extension, and the TLS 1.2 handshake does not look at the ECH state. Real
+ECH (`EchMode::Enable`) is unchanged: TLS 1.3 only, through `with_ech`.
+
 ## P1 invariants
 
 The customized hello is accepted only if:
@@ -168,7 +180,7 @@ everything else Chrome sends for TLS 1.2 comes from the customizer.
 git fetch upstream --tags
 git switch kirika/0.23.46
 git switch -c kirika/0.23.NN
-git rebase --onto v/0.23.NN v/0.23.46     # replays P1..P6
+git rebase --onto v/0.23.NN v/0.23.46     # replays P1..P7
 # resolve conflicts patch by patch (grep "Kirika fork"), then:
 cargo fmt -p rustls
 cargo clippy -j 4 -p rustls --all-targets -- -D warnings -A clippy::nonminimal_bool
@@ -206,7 +218,9 @@ must be followed. A move to 0.24 is a separate project.
   missing / non-empty, SCSV-only), SCT offered / not offered, ALPS, unimplemented
   CBC / RSA / GREASE suites, a TLS 1.3 suite, the downgrade sentinel; a
   ServerKeyExchange group dropped from the sent hello; `UnbufferedClientConnection`
-  handshakes and round trips for TLS 1.2 and TLS 1.3.
+  handshakes and round trips for TLS 1.2 and TLS 1.3; GREASE ECH with TLS 1.2
+  enabled (P7): TLS 1.2 handshakes for each suite, TLS 1.3 with a
+  HelloRetryRequest (same GREASE extension in both hellos), unbuffered TLS 1.2.
 - `rustls/src/client/fork_test.rs` (unit, `aws_lc_rs`): scripted TLS 1.3 server
   (secrets from the client's key log) for ALPS (client EncryptedExtensions bytes,
   server and client Finished over the transcript including both, unsolicited
