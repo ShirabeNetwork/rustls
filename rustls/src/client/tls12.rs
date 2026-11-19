@@ -23,6 +23,7 @@ use crate::hash_hs::HandshakeHash;
 use crate::log::{debug, trace, warn};
 use crate::msgs::base::{Payload, PayloadU8, PayloadU16};
 use crate::msgs::ccs::ChangeCipherSpecPayload;
+use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{
     CertificateChain, ClientDhParams, ClientEcdhParams, ClientKeyExchangeParams,
     HandshakeMessagePayload, HandshakePayload, NewSessionTicketPayload,
@@ -87,6 +88,33 @@ mod server_hello {
                         PeerMisbehaved::ServerEchoedCompatibilitySessionId,
                     )
                 });
+            }
+
+            // Kirika fork P6: a customized hello may carry the empty renegotiation_info
+            // extension instead of the SCSV (rustls itself only sends the SCSV).  The
+            // server must then answer it, and with an empty renegotiated_connection
+            // (RFC 5746 section 3.4).  rustls never renegotiates.
+            if self
+                .input
+                .hello
+                .sent_extensions
+                .contains(&ExtensionType::RenegotiationInfo)
+            {
+                match &server_hello.renegotiation_info {
+                    Some(ri) if ri.0.is_empty() => {}
+                    Some(_) => {
+                        return Err(cx.common.send_fatal_alert(
+                            AlertDescription::HandshakeFailure,
+                            PeerMisbehaved::NonEmptyRenegotiationInfo,
+                        ));
+                    }
+                    None => {
+                        return Err(cx.common.send_fatal_alert(
+                            AlertDescription::HandshakeFailure,
+                            PeerIncompatible::SecureRenegotiationRequired,
+                        ));
+                    }
+                }
             }
 
             let ClientHelloInput {
@@ -950,9 +978,16 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
             &st.server_kx.kx_params,
         )?;
         let maybe_skxg = match &kx_params {
+            // Kirika fork P6: the group must also be in the hello as sent.
             ServerKeyExchangeParams::Ecdh(ecdh) => st
                 .config
-                .find_kx_group(ecdh.curve_params.named_group, ProtocolVersion::TLSv1_2),
+                .find_kx_group(ecdh.curve_params.named_group, ProtocolVersion::TLSv1_2)
+                .filter(|_| {
+                    cx.data
+                        .sent_hello
+                        .offered_groups
+                        .contains(&ecdh.curve_params.named_group)
+                }),
             ServerKeyExchangeParams::Dh(dh) => {
                 let ffdhe_group = dh.as_ffdhe_group();
 

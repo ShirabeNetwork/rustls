@@ -99,6 +99,7 @@ impl ClientHelloDetails {
             .copied()
             .filter(not_grease)
             .collect();
+        facts.offered_groups = self.offered_groups.clone();
         self.sent_key_share_groups = ch
             .key_shares
             .iter()
@@ -147,6 +148,9 @@ pub(super) struct SentHelloFacts {
     /// Extensions rustls does not otherwise know whose responses are tolerated
     /// and ignored, as offered: `signed_certificate_timestamp`, `trust_anchors` (P4).
     pub(super) offered_ignored: Vec<ExtensionType>,
+    /// Non-GREASE groups in the sent `supported_groups`, for the TLS 1.2
+    /// ServerKeyExchange group check (P6).
+    pub(super) offered_groups: Vec<NamedGroup>,
 }
 
 pub(super) enum ClientAuthDetails {

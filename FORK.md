@@ -92,6 +92,42 @@ unknown CertificateEntry extensions still fail to decode. The rustls server keep
 refusing any client CertificateEntry extension (for these two types now as
 `UnsolicitedCertExtension` instead of a decode error).
 
+### P6 TLS 1.2 with a customized ClientHello
+
+A customized hello may offer TLS 1.2 next to TLS 1.3 (client config with both
+versions, `tls12` feature) with Chrome's TLS 1.2 suites; rustls implements the six
+ECDHE + AEAD ones (`c02b c02f c02c c030 cca9 cca8`). The TLS 1.2 handshake itself
+needed no change; three checks were adjusted, only reachable through a customizer:
+
+- `renegotiation_info` (RFC 5746): rustls itself sends only the SCSV and, as
+  upstream, neither requires nor inspects the server's extension. If the hello
+  as sent carried the **extension** (Chrome drops the SCSV), a TLS 1.2 ServerHello
+  must answer it with an empty `renegotiated_connection`: missing fails with
+  `PeerIncompatible::SecureRenegotiationRequired`, non-empty with
+  `PeerMisbehaved::NonEmptyRenegotiationInfo` (both `handshake_failure` alerts).
+  This is stricter than Chrome / BoringSSL, which accept a server without RFC 5746
+  support; rustls never renegotiates either way. The check depends only on the
+  extension being sent (with or without the SCSV); a hello with only the SCSV
+  behaves as upstream.
+- `signed_certificate_timestamp` (0x0012) in a TLS 1.2 ServerHello is accepted
+  and ignored if offered in the hello as sent (TLS 1.3: CertificateEntry, P4);
+  not offered: `UnsolicitedServerHelloExtension`.
+- The TLS 1.2 ServerKeyExchange ECDHE group must also be in the sent
+  `supported_groups` (`SelectedUnofferedKxGroup`), like the TLS 1.3 checks of P1.
+
+Unchanged and tested: ALPS in a TLS 1.2 ServerHello is unsolicited
+(`UnsolicitedServerHelloExtension`; ALPS is TLS 1.3 only and no client
+EncryptedExtensions is sent); a CBC / RSA key exchange suite (`c013 c014 009c
+009d 002f 0035`), a GREASE suite or any suite the provider does not implement
+fails with `SelectedUnofferedCipherSuite`; a TLS 1.3 suite in a TLS 1.2
+ServerHello with `SelectedUnusableCipherSuiteForVersion`; the RFC 8446 downgrade
+sentinel with `AttemptedDowngradeToTls12WhenTls13IsSupported`. EMS, session
+ticket and status_request acks follow upstream (`extended_master_secret` is used
+when the server acks it; a NewSessionTicket is received but never stored for
+resumption; a stapled OCSP response is handed to the verifier). The connection
+uses rustls' own TLS 1.2 record layer, also through the unbuffered API; no
+secret extraction is involved.
+
 ## P1 invariants
 
 The customized hello is accepted only if:
@@ -108,7 +144,7 @@ The customized hello is accepted only if:
    `encrypted_client_hello`, `ech_outer_extensions` and the QUIC transport
    parameter extensions are present exactly when rustls sent them, with
    byte-identical bodies;
-6. `supported_versions` offers TLS 1.3.
+6. `supported_versions` offers TLS 1.3 (it may also offer TLS 1.2, P6).
 
 GREASE values in cipher suites, groups, key shares, versions, signature
 algorithms and extension types are tolerated, as are unknown extensions,
@@ -123,8 +159,9 @@ for a group no share was sent for with `WrongGroupForKeyShare`.
 Known limits: with real ECH *accepted*, the server answered the rustls-shaped
 inner hello while offered suites / groups are recorded from the customized outer
 hello, so a customizer should not drop suites, groups or key shares rustls
-offered when ECH is enabled. TLS 1.2 with a customizer is not tested (Kirika
-uses TLS 1.3-only configs).
+offered when ECH is enabled. TLS 1.2 needs the client config to enable TLS 1.2
+(and the `tls12` feature); rustls offers the SCSV, EMS and status_request itself,
+everything else Chrome sends for TLS 1.2 comes from the customizer.
 
 ## Rebasing onto a newer upstream 0.23.x tag
 
@@ -132,12 +169,12 @@ uses TLS 1.3-only configs).
 git fetch upstream --tags
 git switch kirika/0.23.46
 git switch -c kirika/0.23.NN
-git rebase --onto v/0.23.NN v/0.23.46     # replays P1..P4 and FORK.md
+git rebase --onto v/0.23.NN v/0.23.46     # replays P1..P6
 # resolve conflicts patch by patch (grep "Kirika fork"), then:
 cargo fmt -p rustls
 cargo clippy -j 4 -p rustls --all-targets -- -D warnings -A clippy::nonminimal_bool
 cargo test -j 4 -p rustls
-cargo test -j 4 -p rustls --no-default-features --features aws_lc_rs,std
+cargo test -j 4 -p rustls --no-default-features --features aws_lc_rs,std,tls12
 git push origin kirika/0.23.NN
 ```
 
@@ -158,6 +195,19 @@ must be followed. A move to 0.24 is a separate project.
   independent X25519 share (P2); ECH GREASE with HRR; real ECH (the payload
   opens with HPKE using the customized outer hello as AAD; the outer handshake
   verifies up to the expected ECH rejection); QUIC refused.
+- Same file, module `tls12` (P6, needs `tls12`): a Chrome-shaped customizer
+  (both versions, Chrome's 15 suites without the SCSV, renegotiation_info, EMS,
+  empty session_ticket, status_request, SCT, ALPS, compress_certificate, GREASE,
+  padding) against TLS 1.2-only rustls servers: full handshakes and data round
+  trips for each of the six ECDHE + AEAD suites (ECDSA P-256 / RSA 2048 certs) ×
+  {EMS, no EMS} × {tickets, none} × {OCSP stapled, none}, checking the
+  ServerHello acks, NewSessionTicket and CertificateStatus on the wire; P-256 /
+  P-384 and SCSV-only variants; the same hello negotiating TLS 1.3 with each
+  TLS 1.3 suite; scripted TLS 1.2 ServerHellos for renegotiation_info (empty /
+  missing / non-empty, SCSV-only), SCT offered / not offered, ALPS, unimplemented
+  CBC / RSA / GREASE suites, a TLS 1.3 suite, the downgrade sentinel; a
+  ServerKeyExchange group dropped from the sent hello; `UnbufferedClientConnection`
+  handshakes and round trips for TLS 1.2 and TLS 1.3.
 - `rustls/src/client/fork_test.rs` (unit, `aws_lc_rs`): scripted TLS 1.3 server
   (secrets from the client's key log) for ALPS (client EncryptedExtensions bytes,
   server and client Finished over the transcript including both, unsolicited
@@ -165,7 +215,7 @@ must be followed. A move to 0.24 is a separate project.
 
 ```sh
 cargo test -j 4 -p rustls                                                     # default features
-cargo test -j 4 -p rustls --no-default-features --features aws_lc_rs,std       # Kirika's features
+cargo test -j 4 -p rustls --no-default-features --features aws_lc_rs,std,tls12 # Kirika's features
 cargo test -j 4 -p rustls --test client_hello_customizer
 cargo test -j 4 -p rustls --lib fork_test
 ```

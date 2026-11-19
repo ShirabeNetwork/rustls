@@ -319,6 +319,9 @@ pub enum PeerMisbehaved {
     UnsolicitedServerHelloExtension,
     WrongGroupForKeyShare,
     UnsolicitedEchExtension,
+    /// Kirika fork P6: a TLS 1.2 ServerHello answered a sent `renegotiation_info`
+    /// extension with a non-empty `renegotiated_connection` (RFC 5746).
+    NonEmptyRenegotiationInfo,
 }
 
 impl From<PeerMisbehaved> for Error {
@@ -359,6 +362,9 @@ pub enum PeerIncompatible {
     UncompressedEcPointsRequired,
     UnsolicitedCertificateTypeExtension,
     ServerRejectedEncryptedClientHello(Option<Vec<EchConfigPayload>>),
+    /// Kirika fork P6: a TLS 1.2 ServerHello lacks `renegotiation_info` although
+    /// the ClientHello as sent carried the extension (RFC 5746 secure renegotiation).
+    SecureRenegotiationRequired,
 }
 
 impl From<PeerIncompatible> for Error {

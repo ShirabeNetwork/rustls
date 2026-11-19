@@ -845,11 +845,24 @@ impl State<ClientConnectionData> for ExpectServerHello {
             });
         }
 
-        let allowed_unsolicited = [ExtensionType::RenegotiationInfo];
+        // Kirika fork P6: signed_certificate_timestamp in a TLS 1.2 ServerHello, if
+        // offered in the hello as sent; ignored.  (TLS 1.3 carries it in the
+        // CertificateEntry, P4.)
+        let allowed_unsolicited: &[ExtensionType] = if version == TLSv1_2
+            && cx
+                .data
+                .sent_hello
+                .offered_ignored
+                .contains(&ExtensionType::SCT)
+        {
+            &[ExtensionType::RenegotiationInfo, ExtensionType::SCT]
+        } else {
+            &[ExtensionType::RenegotiationInfo]
+        };
         if self
             .input
             .hello
-            .server_sent_unsolicited_extensions(server_hello, &allowed_unsolicited)
+            .server_sent_unsolicited_extensions(server_hello, allowed_unsolicited)
         {
             return Err(cx.common.send_fatal_alert(
                 AlertDescription::UnsupportedExtension,

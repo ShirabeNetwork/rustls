@@ -1067,3 +1067,747 @@ fn independent_share_is_replaced_after_hello_retry_request() {
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].0, u16::from(NamedGroup::secp256r1));
 }
+
+// --- P6: TLS 1.2 with a customized ClientHello ---
+
+#[cfg(feature = "tls12")]
+mod tls12 {
+    use rustls::internal::msgs::enums::ExtensionType;
+    use rustls::internal::msgs::message::{Message, MessagePayload};
+    use rustls::server::UnbufferedServerConnection;
+    use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
+    use rustls::version::TLS12;
+    use rustls::{CipherSuite, PeerMisbehaved, ProtocolVersion};
+    use rustls_test::encoding::{Extension, message_framing, server_hello};
+    use rustls_test::{Altered, do_handshake_altered, do_unbuffered_handshake};
+
+    use super::*;
+
+    const EXT_STATUS_REQUEST: u16 = 0x0005;
+    const EXT_EMS: u16 = 0x0017;
+    const EXT_SESSION_TICKET: u16 = 0x0023;
+    const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
+    const SCSV: u16 = 0x00ff;
+
+    /// Chrome's cipher suites after the GREASE value: three TLS 1.3 suites, the
+    /// six ECDHE + AEAD TLS 1.2 suites rustls implements, then six CBC / RSA key
+    /// exchange suites it does not.
+    const CHROME_SUITES: [u16; 15] = [
+        0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014,
+        0x009c, 0x009d, 0x002f, 0x0035,
+    ];
+    const UNIMPLEMENTED_SUITES: [u16; 6] = [0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035];
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Chrome12 {
+        /// Keep rustls' SCSV and do not add renegotiation_info.
+        scsv_only: bool,
+        /// Remove extended_master_secret.
+        drop_ems: bool,
+        /// Do not offer signed_certificate_timestamp.
+        no_sct: bool,
+        /// Remove this group from supported_groups.
+        drop_group: Option<u16>,
+    }
+
+    /// A Chrome-shaped hello offering TLS 1.3 and TLS 1.2.
+    #[derive(Debug)]
+    struct Chrome12Customizer {
+        opts: Chrome12,
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl ClientHelloCustomizer for Chrome12Customizer {
+        fn customize(
+            &self,
+            _context: &ClientHelloContext<'_>,
+            hello: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), Error> {
+            let mut h = Hello::parse(hello);
+            // rustls offers TLS 1.2 with the SCSV, EMS and status_request, and
+            // no session_ticket (resumption is disabled).
+            assert!(h.suites.contains(&SCSV));
+            assert!(h.ext(EXT_EMS).is_some());
+            assert!(h.ext(EXT_STATUS_REQUEST).is_some());
+            assert!(h.ext(EXT_SESSION_TICKET).is_none());
+            assert!(h.ext(EXT_RENEGOTIATION_INFO).is_none());
+
+            h.suites = vec![0x0a0a];
+            h.suites.extend(CHROME_SUITES);
+            if self.opts.scsv_only {
+                h.suites.push(SCSV);
+            }
+            if let Some(b) = h.ext_mut(EXT_SUPPORTED_GROUPS) {
+                if let Some(drop) = self.opts.drop_group {
+                    let groups: Vec<u8> = b[2..]
+                        .chunks(2)
+                        .filter(|g| u16::from_be_bytes([g[0], g[1]]) != drop)
+                        .flatten()
+                        .copied()
+                        .collect();
+                    *b = (groups.len() as u16)
+                        .to_be_bytes()
+                        .to_vec();
+                    b.extend_from_slice(&groups);
+                }
+                prepend(b, 2, &[0x1a, 0x1a]);
+            }
+            if let Some(b) = h.ext_mut(EXT_SIGNATURE_ALGORITHMS) {
+                prepend(b, 2, &[0x3a, 0x3a]);
+            }
+            if let Some(b) = h.ext_mut(EXT_SUPPORTED_VERSIONS) {
+                assert_eq!(&b[1..], &[0x03, 0x04, 0x03, 0x03]);
+                prepend(b, 1, &[0x2a, 0x2a]);
+            }
+            let mut shares = h.key_shares();
+            shares.insert(0, (0x1a1a, vec![0]));
+            h.set_key_shares(&shares);
+            if self.opts.drop_ems {
+                h.exts.retain(|(t, _)| *t != EXT_EMS);
+            }
+
+            if !self.opts.scsv_only {
+                h.exts
+                    .push((EXT_RENEGOTIATION_INFO, vec![0]));
+            }
+            h.exts
+                .push((EXT_SESSION_TICKET, vec![]));
+            if !self.opts.no_sct {
+                h.exts.push((EXT_SCT, vec![]));
+            }
+            h.exts.push((EXT_ALPS, alps_body()));
+            h.exts
+                .push((EXT_COMPRESS_CERTIFICATE, vec![0x02, 0x00, 0x02]));
+            h.exts.reverse();
+            h.exts.insert(0, (0x4a4a, vec![]));
+            h.exts.push((0x5a5a, vec![0]));
+            h.exts.push((EXT_PADDING, vec![0; 23]));
+
+            let encoded = h.encode();
+            out.extend_from_slice(&encoded);
+            self.sent.lock().unwrap().push(encoded);
+            Ok(())
+        }
+    }
+
+    fn client12(kt: KeyType, opts: Chrome12) -> (ClientConfig, Arc<Chrome12Customizer>) {
+        let builder = ClientConfig::builder_with_provider(kx_provider(default_client_kx()).into())
+            .with_protocol_versions(&[&TLS13, &TLS12])
+            .unwrap();
+        let mut config = finish_client_config(kt, builder);
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let customizer = Arc::new(Chrome12Customizer {
+            opts,
+            sent: Mutex::new(Vec::new()),
+        });
+        config
+            .dangerous()
+            .set_client_hello_customizer(customizer.clone());
+        (config, customizer)
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Server12 {
+        tickets: bool,
+        ocsp: bool,
+    }
+
+    const OCSP: &[u8] = b"not really an ocsp response";
+
+    fn server12(
+        kt: KeyType,
+        version: &'static rustls::SupportedProtocolVersion,
+        suite: SupportedCipherSuite,
+        group: &'static dyn SupportedKxGroup,
+        opts: Server12,
+    ) -> ServerConfig {
+        let provider = CryptoProvider {
+            cipher_suites: vec![suite],
+            kx_groups: vec![group],
+            ..provider::default_provider()
+        };
+        let builder = ServerConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[version])
+            .unwrap()
+            .with_no_client_auth();
+        let mut config = match opts.ocsp {
+            true => builder.with_single_cert_with_ocsp(kt.get_chain(), kt.get_key(), OCSP.to_vec()),
+            false => builder.with_single_cert(kt.get_chain(), kt.get_key()),
+        }
+        .unwrap();
+        if opts.tickets {
+            config.ticketer = provider::Ticketer::new().unwrap();
+        }
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        config
+    }
+
+    fn tls12_suites() -> Vec<(SupportedCipherSuite, KeyType)> {
+        use provider::cipher_suite::*;
+        vec![
+            (TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, KeyType::EcdsaP256),
+            (TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, KeyType::Rsa2048),
+            (TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, KeyType::EcdsaP256),
+            (TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, KeyType::Rsa2048),
+            (
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                KeyType::EcdsaP256,
+            ),
+            (
+                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                KeyType::Rsa2048,
+            ),
+        ]
+    }
+
+    /// Handshake, returning the server's plaintext handshake messages (type, body).
+    fn handshake_capturing(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection,
+    ) -> Vec<(u8, Vec<u8>)> {
+        let mut plaintext = Vec::new();
+        let mut ccs = false;
+        while server.is_handshaking() || client.is_handshaking() {
+            transfer(client, server);
+            server.process_new_packets().unwrap();
+            let mut wire = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut wire).unwrap();
+            }
+            let mut p = 0;
+            while p < wire.len() {
+                let len = usize::from(u16::from_be_bytes([wire[p + 3], wire[p + 4]]));
+                match wire[p] {
+                    0x14 => ccs = true,
+                    0x16 if !ccs => plaintext.extend_from_slice(&wire[p + 5..p + 5 + len]),
+                    _ => {}
+                }
+                p += 5 + len;
+            }
+            let mut rd = wire.as_slice();
+            while !rd.is_empty() {
+                client.read_tls(&mut rd).unwrap();
+            }
+            client.process_new_packets().unwrap();
+        }
+
+        let mut msgs = Vec::new();
+        let mut p = 0;
+        while p < plaintext.len() {
+            let len = (usize::from(plaintext[p + 1]) << 16)
+                | (usize::from(plaintext[p + 2]) << 8)
+                | usize::from(plaintext[p + 3]);
+            msgs.push((plaintext[p], plaintext[p + 4..p + 4 + len].to_vec()));
+            p += 4 + len;
+        }
+        msgs
+    }
+
+    /// Extensions of a ServerHello body.
+    fn server_hello_exts(body: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let sid_len = usize::from(body[34]);
+        let mut p = 35 + sid_len + 3 + 2;
+        let mut exts = Vec::new();
+        while p < body.len() {
+            let typ = u16::from_be_bytes([body[p], body[p + 1]]);
+            let l = usize::from(u16::from_be_bytes([body[p + 2], body[p + 3]]));
+            exts.push((typ, body[p + 4..p + 4 + l].to_vec()));
+            p += 4 + l;
+        }
+        exts
+    }
+
+    fn full_tls12_handshake(
+        suite: SupportedCipherSuite,
+        kt: KeyType,
+        group: &'static dyn SupportedKxGroup,
+        client_opts: Chrome12,
+        server_opts: Server12,
+    ) {
+        let what = format!(
+            "{suite:?} {:?} {client_opts:?} {server_opts:?}",
+            group.name()
+        );
+        let (config, customizer) = client12(kt, client_opts);
+        let mut client = ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+        let mut server =
+            ServerConnection::new(Arc::new(server12(kt, &TLS12, suite, group, server_opts)))
+                .unwrap();
+        let msgs = handshake_capturing(&mut client, &mut server);
+
+        assert_eq!(
+            client.protocol_version(),
+            Some(ProtocolVersion::TLSv1_2),
+            "{what}"
+        );
+        assert_eq!(client.negotiated_cipher_suite(), Some(suite), "{what}");
+        assert_eq!(
+            client
+                .negotiated_key_exchange_group()
+                .unwrap()
+                .name(),
+            group.name(),
+            "{what}"
+        );
+        assert_eq!(client.alpn_protocol(), Some(&b"h2"[..]), "{what}");
+        round_trip(&mut client, &mut server);
+
+        // The customized hello was sent (no SCSV unless asked to keep it).
+        let sent = customizer.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{what}");
+        let sent = Hello::parse(&sent[0]);
+        assert_eq!(sent.suites.contains(&SCSV), client_opts.scsv_only);
+
+        // What the server answered.
+        let types: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+        assert_eq!(types[0], 2, "{what}: ServerHello first");
+        let exts = server_hello_exts(&msgs[0].1);
+        let ext = |typ: u16| {
+            exts.iter()
+                .find(|(t, _)| *t == typ)
+                .map(|(_, b)| b.clone())
+        };
+        assert_eq!(ext(EXT_RENEGOTIATION_INFO), Some(vec![0]), "{what}");
+        assert_eq!(ext(EXT_EMS).is_some(), !client_opts.drop_ems, "{what}: EMS");
+        assert_eq!(
+            ext(EXT_SESSION_TICKET).is_some(),
+            server_opts.tickets,
+            "{what}: session_ticket"
+        );
+        assert_eq!(
+            ext(EXT_STATUS_REQUEST).is_some(),
+            server_opts.ocsp,
+            "{what}: status_request"
+        );
+        assert_eq!(
+            types.contains(&4),
+            server_opts.tickets,
+            "{what}: NewSessionTicket"
+        );
+        assert_eq!(
+            types.contains(&22),
+            server_opts.ocsp,
+            "{what}: CertificateStatus"
+        );
+        if server_opts.ocsp {
+            let (_, status) = msgs
+                .iter()
+                .find(|(t, _)| *t == 22)
+                .unwrap();
+            assert!(status.ends_with(OCSP), "{what}");
+        }
+    }
+
+    #[test]
+    fn tls12_handshake_for_each_suite_with_and_without_server_features() {
+        for (suite, kt) in tls12_suites() {
+            for drop_ems in [false, true] {
+                for tickets in [false, true] {
+                    for ocsp in [false, true] {
+                        full_tls12_handshake(
+                            suite,
+                            kt,
+                            provider::kx_group::X25519,
+                            Chrome12 {
+                                drop_ems,
+                                ..Chrome12::default()
+                            },
+                            Server12 { tickets, ocsp },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tls12_handshake_with_nist_groups_and_scsv() {
+        for (suite, kt) in tls12_suites() {
+            for group in [provider::kx_group::SECP256R1, provider::kx_group::SECP384R1] {
+                full_tls12_handshake(suite, kt, group, Chrome12::default(), Server12::default());
+            }
+            // The SCSV kept instead of renegotiation_info (rustls' own choice).
+            full_tls12_handshake(
+                suite,
+                kt,
+                provider::kx_group::X25519,
+                Chrome12 {
+                    scsv_only: true,
+                    ..Chrome12::default()
+                },
+                Server12::default(),
+            );
+        }
+    }
+
+    #[test]
+    fn chrome_shaped_hello_negotiates_tls13_when_the_server_can() {
+        for suite in all_tls13_suites() {
+            let (config, _) = client12(KeyType::EcdsaP256, Chrome12::default());
+            let mut client =
+                ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+            let mut server = ServerConnection::new(Arc::new(server12(
+                KeyType::EcdsaP256,
+                &TLS13,
+                suite,
+                provider::kx_group::X25519MLKEM768,
+                Server12::default(),
+            )))
+            .unwrap();
+            do_handshake(&mut client, &mut server);
+            assert_eq!(client.protocol_version(), Some(ProtocolVersion::TLSv1_3));
+            assert_eq!(client.negotiated_cipher_suite(), Some(suite));
+            round_trip(&mut client, &mut server);
+        }
+    }
+
+    /// Feed a scripted TLS 1.2 ServerHello to a client with a Chrome-shaped hello.
+    fn client12_after_server_hello(
+        opts: Chrome12,
+        random: [u8; 32],
+        cipher_suite: CipherSuite,
+        extensions: Vec<Extension>,
+    ) -> Result<(), Error> {
+        let (config, _) = client12(KeyType::Rsa2048, opts);
+        let mut client = ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+        let mut wire = Vec::new();
+        client.write_tls(&mut wire).unwrap();
+
+        let sh = server_hello(
+            ProtocolVersion::TLSv1_2,
+            &random,
+            &[0],
+            cipher_suite,
+            extensions,
+        );
+        let record = message_framing(rustls::ContentType::Handshake, ProtocolVersion::TLSv1_2, sh);
+        client
+            .read_tls(&mut record.as_slice())
+            .unwrap();
+        client.process_new_packets().map(|_| ())
+    }
+
+    fn ext(typ: u16, body: &[u8]) -> Extension {
+        Extension {
+            typ: ExtensionType::from(typ),
+            body: body.to_vec(),
+        }
+    }
+
+    fn empty_ri() -> Extension {
+        ext(EXT_RENEGOTIATION_INFO, &[0])
+    }
+
+    const AEAD_SUITE: CipherSuite = CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256;
+
+    #[test]
+    fn tls12_server_hello_renegotiation_info() {
+        let chrome = Chrome12::default();
+        // Answered with an empty renegotiated_connection: accepted (the client then
+        // waits for the Certificate).
+        assert_eq!(
+            client12_after_server_hello(chrome, [7; 32], AEAD_SUITE, vec![empty_ri()]),
+            Ok(())
+        );
+        // Missing although the hello carried the extension.
+        assert_eq!(
+            client12_after_server_hello(chrome, [7; 32], AEAD_SUITE, vec![]),
+            Err(Error::PeerIncompatible(
+                PeerIncompatible::SecureRenegotiationRequired
+            ))
+        );
+        // Non-empty renegotiated_connection.
+        let mut body = vec![12];
+        body.extend_from_slice(&[0x5a; 12]);
+        assert_eq!(
+            client12_after_server_hello(
+                chrome,
+                [7; 32],
+                AEAD_SUITE,
+                vec![ext(EXT_RENEGOTIATION_INFO, &body)]
+            ),
+            Err(Error::PeerMisbehaved(
+                PeerMisbehaved::NonEmptyRenegotiationInfo
+            ))
+        );
+        // Only the SCSV sent (upstream rustls behaviour): the extension is optional.
+        let scsv_only = Chrome12 {
+            scsv_only: true,
+            ..Chrome12::default()
+        };
+        assert_eq!(
+            client12_after_server_hello(scsv_only, [7; 32], AEAD_SUITE, vec![]),
+            Ok(())
+        );
+        assert_eq!(
+            client12_after_server_hello(scsv_only, [7; 32], AEAD_SUITE, vec![empty_ri()]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn tls12_server_hello_sct_alps_and_acks() {
+        let chrome = Chrome12::default();
+        let sct_list = [0x00, 0x04, 0x00, 0x02, 0xab, 0xcd];
+        // SCT offered: accepted and ignored, as are the other offered acks.
+        assert_eq!(
+            client12_after_server_hello(
+                chrome,
+                [7; 32],
+                AEAD_SUITE,
+                vec![
+                    empty_ri(),
+                    ext(EXT_SCT, &sct_list),
+                    ext(EXT_EMS, &[]),
+                    ext(EXT_SESSION_TICKET, &[]),
+                    ext(EXT_STATUS_REQUEST, &[]),
+                    ext(0x000b, &[0x01, 0x00]), // ec_point_formats: uncompressed
+                    ext(0x0010, &[0x00, 0x03, 0x02, b'h', b'2']),
+                ]
+            ),
+            Ok(())
+        );
+        // SCT not offered.
+        assert_eq!(
+            client12_after_server_hello(
+                Chrome12 {
+                    no_sct: true,
+                    ..Chrome12::default()
+                },
+                [7; 32],
+                AEAD_SUITE,
+                vec![empty_ri(), ext(EXT_SCT, &sct_list)]
+            ),
+            Err(Error::PeerMisbehaved(
+                PeerMisbehaved::UnsolicitedServerHelloExtension
+            ))
+        );
+        // ALPS is TLS 1.3 only (EncryptedExtensions), whether offered or not.
+        assert_eq!(
+            client12_after_server_hello(
+                chrome,
+                [7; 32],
+                AEAD_SUITE,
+                vec![empty_ri(), ext(EXT_ALPS, &alps_body())]
+            ),
+            Err(Error::PeerMisbehaved(
+                PeerMisbehaved::UnsolicitedServerHelloExtension
+            ))
+        );
+        // trust_anchors was not offered.
+        assert_eq!(
+            client12_after_server_hello(
+                chrome,
+                [7; 32],
+                AEAD_SUITE,
+                vec![empty_ri(), ext(EXT_TRUST_ANCHORS, &[0x00, 0x00])]
+            ),
+            Err(Error::PeerMisbehaved(
+                PeerMisbehaved::UnsolicitedServerHelloExtension
+            ))
+        );
+    }
+
+    #[test]
+    fn tls12_server_choosing_unimplemented_suites_fails_cleanly() {
+        let chrome = Chrome12::default();
+        // CBC and RSA key exchange suites: offered by the customizer, not implemented.
+        for suite in UNIMPLEMENTED_SUITES {
+            assert_eq!(
+                client12_after_server_hello(
+                    chrome,
+                    [7; 32],
+                    CipherSuite::from(suite),
+                    vec![empty_ri()]
+                ),
+                Err(Error::PeerMisbehaved(
+                    PeerMisbehaved::SelectedUnofferedCipherSuite
+                )),
+                "{suite:#06x}"
+            );
+        }
+        // GREASE, and a suite neither side offered.
+        for suite in [0x0a0a, 0xc009] {
+            assert_eq!(
+                client12_after_server_hello(
+                    chrome,
+                    [7; 32],
+                    CipherSuite::from(suite),
+                    vec![empty_ri()]
+                ),
+                Err(Error::PeerMisbehaved(
+                    PeerMisbehaved::SelectedUnofferedCipherSuite
+                )),
+                "{suite:#06x}"
+            );
+        }
+        // A TLS 1.3 suite in a TLS 1.2 ServerHello.
+        assert_eq!(
+            client12_after_server_hello(
+                chrome,
+                [7; 32],
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+                vec![empty_ri()]
+            ),
+            Err(Error::PeerMisbehaved(
+                PeerMisbehaved::SelectedUnusableCipherSuiteForVersion
+            ))
+        );
+        // TLS 1.3 offered: the RFC 8446 downgrade sentinel is still enforced.
+        let mut random = [7; 32];
+        random[24..].copy_from_slice(b"DOWNGRD\x01");
+        assert_eq!(
+            client12_after_server_hello(chrome, random, AEAD_SUITE, vec![empty_ri()]),
+            Err(Error::PeerMisbehaved(
+                PeerMisbehaved::AttemptedDowngradeToTls12WhenTls13IsSupported
+            ))
+        );
+    }
+
+    #[test]
+    fn tls12_server_kx_group_must_be_in_the_hello_as_sent() {
+        // The customizer drops secp384r1 from supported_groups; the server is shown a
+        // hello that still offers it and picks it.  The ServerKeyExchange signature
+        // covers only the randoms and parameters, so the client must catch it.
+        let (config, _) = client12(
+            KeyType::Rsa2048,
+            Chrome12 {
+                drop_group: Some(u16::from(NamedGroup::secp384r1)),
+                ..Chrome12::default()
+            },
+        );
+        let client = ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+        let server = ServerConnection::new(Arc::new(server12(
+            KeyType::Rsa2048,
+            &TLS12,
+            provider::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            provider::kx_group::SECP384R1,
+            Server12::default(),
+        )))
+        .unwrap();
+        let restore_group = |msg: &mut Message<'_>| {
+            let MessagePayload::Handshake { encoded, .. } = &msg.payload else {
+                return Altered::InPlace;
+            };
+            if encoded.bytes()[0] != 1 {
+                return Altered::InPlace;
+            }
+            let mut h = Hello::parse(encoded.bytes());
+            append(
+                h.ext_mut(EXT_SUPPORTED_GROUPS).unwrap(),
+                2,
+                &NamedGroup::secp384r1.to_array(),
+            );
+            Altered::Raw(message_framing(
+                rustls::ContentType::Handshake,
+                ProtocolVersion::TLSv1_0,
+                h.encode(),
+            ))
+        };
+        assert_eq!(
+            do_handshake_altered(client, |_| Altered::InPlace, restore_group, server),
+            Err(ErrorFromPeer::Client(Error::PeerMisbehaved(
+                PeerMisbehaved::SelectedUnofferedKxGroup
+            )))
+        );
+    }
+
+    // --- unbuffered API ---
+
+    fn unbuffered_round_trip(
+        client_config: ClientConfig,
+        server_config: ServerConfig,
+        version: ProtocolVersion,
+    ) {
+        let mut client = rustls::client::UnbufferedClientConnection::new(
+            Arc::new(client_config),
+            server_name("localhost"),
+        )
+        .unwrap();
+        let mut server = UnbufferedServerConnection::new(Arc::new(server_config)).unwrap();
+        do_unbuffered_handshake(&mut client, &mut server);
+
+        let mut buf = [0u8; 1024];
+        let used = match client.process_tls_records(&mut []) {
+            UnbufferedStatus {
+                discard: 0,
+                state: Ok(ConnectionState::WriteTraffic(mut wt)),
+            } => wt
+                .encrypt(b"hello from client", &mut buf)
+                .unwrap(),
+            st => panic!("unexpected client state {st:?}"),
+        };
+        match server.process_tls_records(&mut buf[..used]) {
+            UnbufferedStatus {
+                discard,
+                state: Ok(ConnectionState::ReadTraffic(mut rt)),
+            } => {
+                assert_eq!(discard, used);
+                let record = rt.next_record().unwrap().unwrap();
+                assert_eq!(record.payload, b"hello from client");
+            }
+            st => panic!("unexpected server state {st:?}"),
+        }
+
+        let used = match server.process_tls_records(&mut []) {
+            UnbufferedStatus {
+                discard: 0,
+                state: Ok(ConnectionState::WriteTraffic(mut wt)),
+            } => wt
+                .encrypt(b"hello from server", &mut buf)
+                .unwrap(),
+            st => panic!("unexpected server state {st:?}"),
+        };
+        match client.process_tls_records(&mut buf[..used]) {
+            UnbufferedStatus {
+                discard,
+                state: Ok(ConnectionState::ReadTraffic(mut rt)),
+            } => {
+                assert_eq!(discard, used);
+                let record = rt.next_record().unwrap().unwrap();
+                assert_eq!(record.payload, b"hello from server");
+            }
+            st => panic!("unexpected client state {st:?}"),
+        }
+        assert_eq!(client.protocol_version(), Some(version));
+        assert_eq!(client.alpn_protocol(), Some(&b"h2"[..]));
+    }
+
+    #[test]
+    fn unbuffered_tls12_with_customized_hello() {
+        let (config, customizer) = client12(KeyType::EcdsaP256, Chrome12::default());
+        unbuffered_round_trip(
+            config,
+            server12(
+                KeyType::EcdsaP256,
+                &TLS12,
+                provider::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                provider::kx_group::X25519,
+                Server12 {
+                    tickets: true,
+                    ocsp: true,
+                },
+            ),
+            ProtocolVersion::TLSv1_2,
+        );
+        assert_eq!(customizer.sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unbuffered_tls13_with_customized_hello() {
+        let (config, customizer) = client12(KeyType::EcdsaP256, Chrome12::default());
+        unbuffered_round_trip(
+            config,
+            server12(
+                KeyType::EcdsaP256,
+                &TLS13,
+                provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                provider::kx_group::X25519MLKEM768,
+                Server12::default(),
+            ),
+            ProtocolVersion::TLSv1_3,
+        );
+        assert_eq!(customizer.sent.lock().unwrap().len(), 1);
+    }
+}
