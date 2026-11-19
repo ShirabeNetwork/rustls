@@ -18,7 +18,7 @@ use crate::crypto::hash::Context;
 use crate::crypto::tls13::OkmBlock;
 use crate::crypto::{CryptoProvider, hash};
 use crate::enums::{CipherSuite, ContentType, ProtocolVersion, SignatureScheme};
-use crate::error::{Error, PeerMisbehaved};
+use crate::error::{Error, InvalidMessage, PeerMisbehaved};
 use crate::msgs::base::{Payload, PayloadU16};
 use crate::msgs::codec::Codec;
 use crate::msgs::enums::{Compression, NamedGroup};
@@ -288,14 +288,24 @@ impl Scripted {
 
     /// EncryptedExtensions with `exts`, then Certificate, CertificateVerify, Finished.
     fn server_flight(&mut self, exts: &[u8]) -> Result<(), Error> {
+        self.server_flight_with_cert_exts(exts, &[])
+    }
+
+    /// Like `server_flight`, with `cert_exts` in the certificate entry.
+    fn server_flight_with_cert_exts(&mut self, exts: &[u8], cert_exts: &[u8]) -> Result<(), Error> {
         let mut ee = (exts.len() as u16)
             .to_be_bytes()
             .to_vec();
         ee.extend_from_slice(exts);
         self.send(&handshake_msg(8, &ee))?;
 
-        // context(0) + list(u24): one entry, cert "x", no extensions
-        let cert = [0, 0, 0, 6, 0, 0, 1, b'x', 0, 0];
+        // context(0) + list(u24): one entry, cert "x", then `cert_exts`
+        let mut entry = vec![0, 0, 1, b'x'];
+        entry.extend_from_slice(&(cert_exts.len() as u16).to_be_bytes());
+        entry.extend_from_slice(cert_exts);
+        let mut cert = vec![0];
+        cert.extend_from_slice(&(entry.len() as u32).to_be_bytes()[1..]);
+        cert.extend_from_slice(&entry);
         self.send(&handshake_msg(11, &cert))?;
         let mut cv = SignatureScheme::ECDSA_NISTP256_SHA256
             .to_array()
@@ -427,4 +437,70 @@ fn no_client_encrypted_extensions_without_alps() {
         &s.transcript.fork_finish(),
     );
     assert_eq!(flight, handshake_msg(20, &expected));
+}
+
+// --- P4: trust_anchors / signed_certificate_timestamp ---
+
+const SCT: u16 = 0x0012;
+const TRUST_ANCHORS: u16 = 0xca34;
+
+fn ee_with(extra: &[u8]) -> Vec<u8> {
+    let mut exts = ext(0x0010, &alpn_list(&[b"h2"]));
+    exts.extend_from_slice(extra);
+    exts
+}
+
+#[test]
+fn offered_trust_anchors_and_sct_are_tolerated() {
+    let mut s = scripted(vec![(SCT, vec![]), (TRUST_ANCHORS, vec![0, 0])]);
+    let mut cert_exts = ext(SCT, b"\x00\x04sct!");
+    cert_exts.extend(ext(TRUST_ANCHORS, b"\x00\x01x"));
+    s.server_flight_with_cert_exts(&ee_with(&ext(TRUST_ANCHORS, b"")), &cert_exts)
+        .unwrap();
+    assert!(!s.client.is_handshaking());
+}
+
+#[test]
+fn unoffered_trust_anchors_and_sct_are_refused() {
+    let mut s = scripted(vec![]);
+    assert_eq!(
+        s.server_flight(&ee_with(&ext(TRUST_ANCHORS, b""))),
+        Err(PeerMisbehaved::UnsolicitedEncryptedExtension.into())
+    );
+
+    for typ in [SCT, TRUST_ANCHORS] {
+        let mut s = scripted(vec![]);
+        assert_eq!(
+            s.server_flight_with_cert_exts(&ee_with(&[]), &ext(typ, b"")),
+            Err(PeerMisbehaved::UnsolicitedCertExtension.into())
+        );
+    }
+
+    // SCT offered, trust_anchors not.
+    let mut s = scripted(vec![(SCT, vec![])]);
+    assert_eq!(
+        s.server_flight_with_cert_exts(&ee_with(&[]), &ext(TRUST_ANCHORS, b"")),
+        Err(PeerMisbehaved::UnsolicitedCertExtension.into())
+    );
+    let mut s = scripted(vec![(SCT, vec![])]);
+    assert_eq!(
+        s.server_flight(&ee_with(&ext(TRUST_ANCHORS, b""))),
+        Err(PeerMisbehaved::UnsolicitedEncryptedExtension.into())
+    );
+}
+
+#[test]
+fn other_unknown_certificate_extensions_still_fail_to_decode() {
+    let mut s = scripted(vec![(SCT, vec![]), (TRUST_ANCHORS, vec![0, 0])]);
+    assert_eq!(
+        s.server_flight_with_cert_exts(&ee_with(&[]), &ext(0x1234, b"")),
+        Err(InvalidMessage::UnknownCertificateExtension.into())
+    );
+    let mut s = scripted(vec![(SCT, vec![])]);
+    let mut dup = ext(SCT, b"");
+    dup.extend(ext(SCT, b""));
+    assert_eq!(
+        s.server_flight_with_cert_exts(&ee_with(&[]), &dup),
+        Err(InvalidMessage::DuplicateExtension(SCT).into())
+    );
 }

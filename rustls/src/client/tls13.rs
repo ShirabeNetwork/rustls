@@ -529,11 +529,18 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
 
         // Kirika fork P3: ALPS answered for the negotiated protocol, if offered.
         let alps = super::alps::negotiated(&self.hello.offered_alps, exts);
-        let allowed: &[ExtensionType] = match &alps {
-            Some(alps) => core::slice::from_ref(alps),
-            None => &[],
-        };
-        validate_encrypted_extensions(cx.common, &self.hello, exts, allowed)?;
+        let mut allowed = alps.into_iter().collect::<Vec<_>>();
+        // Kirika fork P4: trust_anchors in EncryptedExtensions, if offered; ignored.
+        let trust_anchors = ExtensionType::Unknown(0xca34);
+        if cx
+            .data
+            .sent_hello
+            .offered_ignored
+            .contains(&trust_anchors)
+        {
+            allowed.push(trust_anchors);
+        }
+        validate_encrypted_extensions(cx.common, &self.hello, exts, &allowed)?;
         cx.data.sent_hello.alps = alps;
         hs::process_alpn_protocol(
             cx.common,
@@ -1160,6 +1167,24 @@ impl State<ClientConnectionData> for ExpectCertificate {
             return Err(cx.common.send_fatal_alert(
                 AlertDescription::DecodeError,
                 InvalidMessage::InvalidCertRequest,
+            ));
+        }
+
+        // Kirika fork P4: SCT / trust_anchors entry extensions only if offered; ignored.
+        let unsolicited = cert_chain
+            .entries
+            .iter()
+            .flat_map(|e| e.extensions.ignored.iter())
+            .any(|typ| {
+                !cx.data
+                    .sent_hello
+                    .offered_ignored
+                    .contains(typ)
+            });
+        if unsolicited {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::UnsupportedExtension,
+                PeerMisbehaved::UnsolicitedCertExtension,
             ));
         }
 

@@ -5,7 +5,8 @@ use super::ResolvesClientCert;
 use crate::log::{debug, trace};
 use crate::msgs::enums::{ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
-    CertificateChain, ClientHelloPayload, DistinguishedName, ProtocolName, ServerExtensions,
+    CertificateChain, ClientHelloPayload, DistinguishedName, IGNORED_CERTIFICATE_EXTENSIONS,
+    ProtocolName, ServerExtensions,
 };
 use crate::sync::Arc;
 use crate::{CertificateCompressionAlgorithm, CipherSuite, SignatureScheme, compress, sign};
@@ -76,6 +77,15 @@ impl ClientHelloDetails {
         facts: &mut SentHelloFacts,
     ) {
         self.offered_alps = super::alps::offered(encoded);
+        facts.offered_ignored = super::customize::RawClientHello::parse(encoded)
+            .map(|raw| {
+                raw.extensions
+                    .iter()
+                    .map(|(typ, _)| ExtensionType::from(*typ))
+                    .filter(|typ| IGNORED_CERTIFICATE_EXTENSIONS.contains(typ))
+                    .collect()
+            })
+            .unwrap_or_default();
         let not_grease = |g: &NamedGroup| !super::customize::is_grease(u16::from(*g));
         self.sent_extensions = ch.collect_used();
         self.offered_cipher_suites = ch.cipher_suites.clone();
@@ -134,6 +144,9 @@ pub(super) struct SentHelloFacts {
     pub(super) cert_compression_algs: Vec<CertificateCompressionAlgorithm>,
     /// ALPS codepoint the server answered in EncryptedExtensions (P3).
     pub(super) alps: Option<ExtensionType>,
+    /// Extensions rustls does not otherwise know whose responses are tolerated
+    /// and ignored, as offered: `signed_certificate_timestamp`, `trust_anchors` (P4).
+    pub(super) offered_ignored: Vec<ExtensionType>,
 }
 
 pub(super) enum ClientAuthDetails {

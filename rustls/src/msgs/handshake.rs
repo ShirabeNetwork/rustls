@@ -1729,13 +1729,23 @@ extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
         ExtensionType::StatusRequest =>
             pub(crate) status: Option<CertificateStatus<'a>>,
+    } + {
+        /// Kirika fork P4: extensions accepted by the parser and ignored
+        /// (`signed_certificate_timestamp`, `trust_anchors`).  Peers decide
+        /// whether they were solicited.
+        pub(crate) ignored: Vec<ExtensionType>,
     }
 }
+
+/// Kirika fork P4: certificate entry extensions that are parsed but ignored.
+pub(crate) const IGNORED_CERTIFICATE_EXTENSIONS: [ExtensionType; 2] =
+    [ExtensionType::SCT, ExtensionType::Unknown(0xca34)];
 
 impl CertificateExtensions<'_> {
     fn into_owned(self) -> CertificateExtensions<'static> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
+            ignored: self.ignored,
         }
     }
 }
@@ -1755,12 +1765,21 @@ impl<'a> Codec<'a> for CertificateExtensions<'a> {
         let len = usize::from(u16::read(r)?);
         let mut sub = r.sub(len)?;
 
+        let mut ignored = Vec::new();
         while sub.any_left() {
-            out.read_one(&mut sub, |_unk| {
-                Err(InvalidMessage::UnknownCertificateExtension)
+            out.read_one(&mut sub, |unk| {
+                if !IGNORED_CERTIFICATE_EXTENSIONS.contains(&unk) {
+                    return Err(InvalidMessage::UnknownCertificateExtension);
+                }
+                if ignored.contains(&unk) {
+                    return Err(InvalidMessage::DuplicateExtension(u16::from(unk)));
+                }
+                ignored.push(unk);
+                Ok(())
             })?;
         }
 
+        out.ignored = ignored;
         Ok(out)
     }
 }
