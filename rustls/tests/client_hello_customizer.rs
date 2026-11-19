@@ -1510,12 +1510,11 @@ mod tls12 {
             client12_after_server_hello(chrome, [7; 32], AEAD_SUITE, vec![empty_ri()]),
             Ok(())
         );
-        // Missing although the hello carried the extension.
+        // Missing although the hello carried the extension: accepted (as Chrome /
+        // BoringSSL; rustls never renegotiates).
         assert_eq!(
             client12_after_server_hello(chrome, [7; 32], AEAD_SUITE, vec![]),
-            Err(Error::PeerIncompatible(
-                PeerIncompatible::SecureRenegotiationRequired
-            ))
+            Ok(())
         );
         // Non-empty renegotiated_connection.
         let mut body = vec![12];

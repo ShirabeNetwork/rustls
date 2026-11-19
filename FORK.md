@@ -101,14 +101,13 @@ needed no change; three checks were adjusted, only reachable through a customize
 
 - `renegotiation_info` (RFC 5746): rustls itself sends only the SCSV and, as
   upstream, neither requires nor inspects the server's extension. If the hello
-  as sent carried the **extension** (Chrome drops the SCSV), a TLS 1.2 ServerHello
-  must answer it with an empty `renegotiated_connection`: missing fails with
-  `PeerIncompatible::SecureRenegotiationRequired`, non-empty with
-  `PeerMisbehaved::NonEmptyRenegotiationInfo` (both `handshake_failure` alerts).
-  This is stricter than Chrome / BoringSSL, which accept a server without RFC 5746
-  support; rustls never renegotiates either way. The check depends only on the
-  extension being sent (with or without the SCSV); a hello with only the SCSV
-  behaves as upstream.
+  as sent carried the **extension** (Chrome drops the SCSV), an answer in a TLS 1.2
+  ServerHello must have an empty `renegotiated_connection` (RFC 5746 section 3.4),
+  otherwise `PeerMisbehaved::NonEmptyRenegotiationInfo` (`handshake_failure`). A
+  missing answer is accepted, as for the SCSV upstream and in Chrome / BoringSSL:
+  the RFC 5746 splice attack needs the client to renegotiate, which rustls never
+  does (it refuses HelloRequest), so requiring the extension would only lose
+  legacy servers. A hello with only the SCSV behaves as upstream.
 - `signed_certificate_timestamp` (0x0012) in a TLS 1.2 ServerHello is accepted
   and ignored if offered in the hello as sent (TLS 1.3: CertificateEntry, P4);
   not offered: `UnsolicitedServerHelloExtension`.

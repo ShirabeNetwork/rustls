@@ -362,9 +362,6 @@ pub enum PeerIncompatible {
     UncompressedEcPointsRequired,
     UnsolicitedCertificateTypeExtension,
     ServerRejectedEncryptedClientHello(Option<Vec<EchConfigPayload>>),
-    /// Kirika fork P6: a TLS 1.2 ServerHello lacks `renegotiation_info` although
-    /// the ClientHello as sent carried the extension (RFC 5746 secure renegotiation).
-    SecureRenegotiationRequired,
 }
 
 impl From<PeerIncompatible> for Error {

@@ -91,30 +91,24 @@ mod server_hello {
             }
 
             // Kirika fork P6: a customized hello may carry the empty renegotiation_info
-            // extension instead of the SCSV (rustls itself only sends the SCSV).  The
-            // server must then answer it, and with an empty renegotiated_connection
-            // (RFC 5746 section 3.4).  rustls never renegotiates.
+            // extension instead of the SCSV (rustls itself only sends the SCSV).  An
+            // answer must have an empty renegotiated_connection (RFC 5746 section 3.4).
+            // A missing answer is accepted, as with the SCSV upstream and in Chrome /
+            // BoringSSL: rustls never renegotiates.
             if self
                 .input
                 .hello
                 .sent_extensions
                 .contains(&ExtensionType::RenegotiationInfo)
+                && server_hello
+                    .renegotiation_info
+                    .as_ref()
+                    .is_some_and(|ri| !ri.0.is_empty())
             {
-                match &server_hello.renegotiation_info {
-                    Some(ri) if ri.0.is_empty() => {}
-                    Some(_) => {
-                        return Err(cx.common.send_fatal_alert(
-                            AlertDescription::HandshakeFailure,
-                            PeerMisbehaved::NonEmptyRenegotiationInfo,
-                        ));
-                    }
-                    None => {
-                        return Err(cx.common.send_fatal_alert(
-                            AlertDescription::HandshakeFailure,
-                            PeerIncompatible::SecureRenegotiationRequired,
-                        ));
-                    }
-                }
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::HandshakeFailure,
+                    PeerMisbehaved::NonEmptyRenegotiationInfo,
+                ));
             }
 
             let ClientHelloInput {
