@@ -108,7 +108,15 @@ pub(super) fn handle_server_hello(
         _ => None,
     };
 
-    let our_key_share = KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share)
+    // Kirika fork: the server must pick one of the key shares actually sent.
+    let our_key_share = Some(())
+        .filter(|_| {
+            hello
+                .sent_key_share_groups
+                .contains(&their_key_share.group)
+        })
+        .ok_or(())
+        .and_then(|_| KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share))
         .map_err(|_| {
             cx.common.send_fatal_alert(
                 AlertDescription::IllegalParameter,
@@ -312,6 +320,8 @@ pub(super) fn initial_key_share(
         .resumption
         .store
         .kx_hint(server_name)
+        // Kirika fork: no stored hints with a ClientHello customizer.
+        .filter(|_| config.client_hello_customizer.is_none())
         .and_then(|group_name| config.find_kx_group(group_name, ProtocolVersion::TLSv1_3))
         .unwrap_or_else(|| {
             config
@@ -1003,11 +1013,18 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
             HandshakePayload::CompressedCertificate
         )?;
 
+        // Kirika fork: the algorithm must also have been offered in the hello as sent.
         let selected_decompressor = self
             .config
             .cert_decompressors
             .iter()
-            .find(|item| item.algorithm() == compressed_cert.alg);
+            .find(|item| item.algorithm() == compressed_cert.alg)
+            .filter(|_| {
+                cx.data
+                    .sent_hello
+                    .cert_compression_algs
+                    .contains(&compressed_cert.alg)
+            });
 
         let Some(decompressor) = selected_decompressor else {
             return Err(cx.common.send_fatal_alert(

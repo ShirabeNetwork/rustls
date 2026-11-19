@@ -3,10 +3,12 @@ use alloc::vec::Vec;
 
 use super::ResolvesClientCert;
 use crate::log::{debug, trace};
-use crate::msgs::enums::ExtensionType;
-use crate::msgs::handshake::{CertificateChain, DistinguishedName, ProtocolName, ServerExtensions};
+use crate::msgs::enums::{ExtensionType, NamedGroup};
+use crate::msgs::handshake::{
+    CertificateChain, ClientHelloPayload, DistinguishedName, ProtocolName, ServerExtensions,
+};
 use crate::sync::Arc;
-use crate::{CipherSuite, SignatureScheme, compress, sign};
+use crate::{CertificateCompressionAlgorithm, CipherSuite, SignatureScheme, compress, sign};
 
 #[derive(Debug)]
 pub(super) struct ServerCertDetails<'a> {
@@ -40,6 +42,10 @@ pub(super) struct ClientHelloDetails {
     pub(super) extension_order_seed: u16,
     pub(super) offered_cert_compression: bool,
     pub(super) offered_cipher_suites: Vec<CipherSuite>,
+    /// Non-GREASE groups in the sent `supported_groups` (Kirika fork).
+    pub(super) offered_groups: Vec<NamedGroup>,
+    /// Non-GREASE groups of the sent key shares (Kirika fork).
+    pub(super) sent_key_share_groups: Vec<NamedGroup>,
 }
 
 impl ClientHelloDetails {
@@ -50,7 +56,41 @@ impl ClientHelloDetails {
             extension_order_seed,
             offered_cert_compression: false,
             offered_cipher_suites: Vec::new(),
+            offered_groups: Vec::new(),
+            sent_key_share_groups: Vec::new(),
         }
+    }
+
+    /// Record what the ClientHello actually sent offers (Kirika fork).
+    ///
+    /// `ch` is the hello as sent, which differs from the one rustls built
+    /// when a `ClientHelloCustomizer` is set.  Extensions rustls cannot parse
+    /// are not recorded as offered.
+    pub(super) fn record_sent(&mut self, ch: &ClientHelloPayload, facts: &mut SentHelloFacts) {
+        let not_grease = |g: &NamedGroup| !super::customize::is_grease(u16::from(*g));
+        self.sent_extensions = ch.collect_used();
+        self.offered_cipher_suites = ch.cipher_suites.clone();
+        self.offered_cert_compression = ch
+            .certificate_compression_algorithms
+            .is_some();
+        self.offered_groups = ch
+            .named_groups
+            .iter()
+            .flatten()
+            .copied()
+            .filter(not_grease)
+            .collect();
+        self.sent_key_share_groups = ch
+            .key_shares
+            .iter()
+            .flatten()
+            .map(|kse| kse.group)
+            .filter(not_grease)
+            .collect();
+        facts.cert_compression_algs = ch
+            .certificate_compression_algorithms
+            .clone()
+            .unwrap_or_default();
     }
 
     pub(super) fn server_sent_unsolicited_extensions(
@@ -75,6 +115,14 @@ impl ClientHelloDetails {
 
         false
     }
+}
+
+/// Facts about the ClientHello actually sent that handshake states after
+/// EncryptedExtensions check the server's messages against (Kirika fork).
+#[derive(Debug, Default)]
+pub(super) struct SentHelloFacts {
+    /// Offered certificate compression algorithms.
+    pub(super) cert_compression_algs: Vec<CertificateCompressionAlgorithm>,
 }
 
 pub(super) enum ClientAuthDetails {

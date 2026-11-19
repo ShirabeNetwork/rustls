@@ -294,6 +294,10 @@ pub struct ClientConfig {
     ///
     /// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
     pub send_ticket_request: Option<TicketRequest>,
+
+    /// Kirika fork: reshapes the ClientHello, see
+    /// [`danger::DangerousClientConfig::set_client_hello_customizer`].
+    pub(super) client_hello_customizer: Option<Arc<dyn super::customize::ClientHelloCustomizer>>,
 }
 
 /// Desired session ticket counts for the RFC 9149 `ticket_request` extension.
@@ -574,6 +578,24 @@ pub(super) mod danger {
         /// Overrides the default `ServerCertVerifier` with something else.
         pub fn set_certificate_verifier(&mut self, verifier: Arc<dyn ServerCertVerifier>) {
             self.cfg.verifier = verifier;
+        }
+
+        /// Installs a [`ClientHelloCustomizer`] (Kirika fork).
+        ///
+        /// Session resumption is not supported with a customizer: this replaces
+        /// `resumption` with [`Resumption::disabled()`] and turns off early data,
+        /// and while a customizer is set the handshake never reads a stored
+        /// session or key exchange hint, even if `resumption` is changed later.
+        /// A customizer cannot be used for QUIC.
+        ///
+        /// [`ClientHelloCustomizer`]: super::super::customize::ClientHelloCustomizer
+        pub fn set_client_hello_customizer(
+            &mut self,
+            customizer: Arc<dyn super::super::customize::ClientHelloCustomizer>,
+        ) {
+            self.cfg.client_hello_customizer = Some(customizer);
+            self.cfg.resumption = super::Resumption::disabled();
+            self.cfg.enable_early_data = false;
         }
     }
 }
@@ -1075,6 +1097,7 @@ impl std::error::Error for EarlyDataError {}
 pub struct ClientConnectionData {
     pub(super) early_data: EarlyData,
     pub(super) ech_status: EchStatus,
+    pub(super) sent_hello: super::common::SentHelloFacts,
 }
 
 impl ClientConnectionData {
@@ -1082,6 +1105,7 @@ impl ClientConnectionData {
         Self {
             early_data: EarlyData::new(),
             ech_status: EchStatus::NotOffered,
+            sent_hello: super::common::SentHelloFacts::default(),
         }
     }
 }

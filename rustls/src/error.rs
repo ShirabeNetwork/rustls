@@ -105,6 +105,12 @@ pub enum Error {
     /// [`keys_match`]: crate::crypto::signer::CertifiedKey::keys_match
     InconsistentKeys(InconsistentKeys),
 
+    /// A [`ClientHelloCustomizer`] produced a ClientHello that rustls refused
+    /// (Kirika fork).
+    ///
+    /// [`ClientHelloCustomizer`]: crate::client::danger::ClientHelloCustomizer
+    InvalidCustomClientHello(crate::client::danger::CustomClientHelloError),
+
     /// Any other error.
     ///
     /// This variant should only be used when the error is not better described by a more
@@ -1006,6 +1012,9 @@ impl fmt::Display for Error {
             }
             Self::InconsistentKeys(why) => {
                 write!(f, "keys may not be consistent: {why:?}")
+            }
+            Self::InvalidCustomClientHello(why) => {
+                write!(f, "invalid customized ClientHello: {why}")
             }
             Self::General(err) => write!(f, "unexpected error: {err}"),
             Self::Other(err) => write!(f, "other error: {err}"),

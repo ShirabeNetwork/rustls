@@ -583,6 +583,7 @@ pub mod client {
     pub(super) mod builder;
     mod client_conn;
     mod common;
+    mod customize;
     mod ech;
     pub(super) mod handy;
     mod hs;
@@ -608,6 +609,9 @@ pub mod client {
     pub mod danger {
         pub use super::builder::danger::DangerousClientConfigBuilder;
         pub use super::client_conn::danger::DangerousClientConfig;
+        pub use super::customize::{
+            ClientHelloContext, ClientHelloCustomizer, CustomClientHelloError, HelloRetryContext,
+        };
         pub use crate::verify::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     }
 

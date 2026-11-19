@@ -163,7 +163,7 @@ impl EchConfig {
         server_name: ServerName<'static>,
         config: &ClientConfig,
     ) -> Result<EchState, Error> {
-        EchState::new(
+        let mut state = EchState::new(
             self,
             server_name.clone(),
             config
@@ -171,7 +171,11 @@ impl EchConfig {
                 .has_certs(),
             config.provider.secure_random,
             config.enable_sni,
-        )
+        )?;
+        // Kirika fork: a customized outer hello no longer carries rustls' extension
+        // bodies in rustls' order, so the inner hello must not reference them.
+        state.compress_outer_extensions = config.client_hello_customizer.is_none();
+        Ok(state)
     }
 
     /// Compute the HPKE `SetupBaseS` `info` parameter for this ECH configuration.
@@ -329,6 +333,8 @@ pub(crate) struct EchState {
     // Whether a hello retry request accepted our ECH offer, if we received one. RFC 9849
     // section 6.1.4 makes that decision final.
     accepted_by_hello_retry_request: Option<bool>,
+    // Kirika fork: whether the inner hello may use `ech_outer_extensions`.
+    compress_outer_extensions: bool,
 }
 
 impl EchState {
@@ -374,6 +380,7 @@ impl EchState {
             enable_sni,
             sent_extensions: Vec::new(),
             accepted_by_hello_retry_request: None,
+            compress_outer_extensions: true,
         })
     }
 
@@ -387,10 +394,42 @@ impl EchState {
     /// If `resuming` is `Some`, then the inner hello will be constructed for a resumption handshake.
     pub(crate) fn ech_hello(
         &mut self,
-        mut outer_hello: ClientHelloPayload,
+        outer_hello: ClientHelloPayload,
         retry_req: Option<&HelloRetryRequest>,
         resuming: &Option<Retrieved<&persist::Tls13ClientSessionValue>>,
     ) -> Result<ClientHelloPayload, Error> {
+        let (mut outer_hello, encoded_inner_hello) =
+            self.ech_hello_unsealed(outer_hello, retry_req, resuming)?;
+
+        // Next we compute the proper extension payload.
+        let payload = self.seal(&outer_hello.get_encoding(), &encoded_inner_hello)?;
+
+        // And then we replace the placeholder payload with the real one.
+        if let Some(EncryptedClientHello::Outer(outer)) = &mut outer_hello.encrypted_client_hello {
+            outer.payload = PayloadU16::new(payload);
+        }
+
+        Ok(outer_hello)
+    }
+
+    /// Encrypt the encoded inner hello with `aad` (the ClientHelloOuterAAD).
+    pub(crate) fn seal(
+        &mut self,
+        aad: &[u8],
+        encoded_inner_hello: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        self.sender
+            .seal(aad, encoded_inner_hello)
+    }
+
+    /// Like `ech_hello`, but leaves the all-zero placeholder payload in the outer
+    /// hello and returns the encoded inner hello for `seal` (Kirika fork).
+    pub(crate) fn ech_hello_unsealed(
+        &mut self,
+        mut outer_hello: ClientHelloPayload,
+        retry_req: Option<&HelloRetryRequest>,
+        resuming: &Option<Retrieved<&persist::Tls13ClientSessionValue>>,
+    ) -> Result<(ClientHelloPayload, Vec<u8>), Error> {
         trace!(
             "Preparing ECH offer {}",
             if retry_req.is_some() { "for retry" } else { "" }
@@ -435,18 +474,9 @@ impl EchState {
         }
 
         // To compute the encoded AAD we add a placeholder extension with an empty payload.
-        outer_hello.encrypted_client_hello =
-            Some(outer_hello_ext(self, enc.clone(), vec![0; payload_len]));
+        outer_hello.encrypted_client_hello = Some(outer_hello_ext(self, enc, vec![0; payload_len]));
 
-        // Next we compute the proper extension payload.
-        let payload = self
-            .sender
-            .seal(&outer_hello.get_encoding(), &encoded_inner_hello)?;
-
-        // And then we replace the placeholder extension with the real one.
-        outer_hello.encrypted_client_hello = Some(outer_hello_ext(self, enc, payload));
-
-        Ok(outer_hello)
+        Ok((outer_hello, encoded_inner_hello))
     }
 
     /// Confirm whether an ECH offer was accepted based on examining the server hello.
@@ -668,7 +698,7 @@ impl EchState {
 
             // Compressed extensions need to be put aside to include in one contiguous block.
             // Uncompressed extensions get added directly to the inner hello.
-            if ext.ech_compress() {
+            if ext.ech_compress() && self.compress_outer_extensions {
                 compressed_exts.push(ext);
             }
 

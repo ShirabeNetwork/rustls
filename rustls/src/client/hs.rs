@@ -15,6 +15,7 @@ use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
+use crate::client::customize::{self, ClientHelloContext, HelloRetryContext, PendingEchSeal};
 use crate::client::ech::EchState;
 use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
@@ -75,6 +76,8 @@ pub(super) struct ClientHelloInput {
     pub(super) session_id: SessionId,
     pub(super) server_name: ServerName<'static>,
     pub(super) prev_ech_ext: Option<EncryptedClientHello>,
+    /// The first ClientHello as sent, when a customizer is set (Kirika fork).
+    pub(super) sent_client_hello: Option<Vec<u8>>,
 }
 
 impl ClientHelloInput {
@@ -135,6 +138,7 @@ impl ClientHelloInput {
             session_id,
             server_name,
             prev_ech_ext: None,
+            sent_client_hello: None,
             config,
         })
     }
@@ -144,6 +148,15 @@ impl ClientHelloInput {
         extra_exts: ClientExtensionsInput<'static>,
         cx: &mut ClientContext<'_>,
     ) -> NextStateOrError<'static> {
+        if self
+            .config
+            .client_hello_customizer
+            .is_some()
+            && cx.common.is_quic()
+        {
+            return Err(customize::CustomClientHelloError::QuicNotSupported.into());
+        }
+
         let mut transcript_buffer = HandshakeHashBuffer::new();
         if self
             .config
@@ -173,6 +186,7 @@ impl ClientHelloInput {
         emit_client_hello_for_retry(
             transcript_buffer,
             None,
+            None,
             key_share,
             extra_exts,
             None,
@@ -191,6 +205,7 @@ impl ClientHelloInput {
 fn emit_client_hello_for_retry(
     mut transcript_buffer: HandshakeHashBuffer,
     retryreq: Option<&HelloRetryRequest>,
+    retryreq_encoded: Option<&[u8]>,
     key_share: Option<Box<dyn ActiveKeyExchange>>,
     extra_exts: ClientExtensionsInput<'static>,
     suite: Option<SupportedCipherSuite>,
@@ -414,9 +429,20 @@ fn emit_client_hello_for_retry(
             _ => None,
         });
 
+    // Kirika fork: with a customizer, a real ECH offer is sealed after customization.
+    let mut ech_pending_inner = None;
     match (cx.data.ech_status, &mut ech_state) {
         // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
         // we need to replace the client hello payload with an ECH client hello payload.
+        (EchStatus::NotOffered | EchStatus::Offered, Some(ech_state))
+            if config.client_hello_customizer.is_some() =>
+        {
+            let (outer, inner) =
+                ech_state.ech_hello_unsealed(chp_payload, retryreq, &tls13_session)?;
+            chp_payload = outer;
+            ech_pending_inner = Some(inner);
+            cx.data.ech_status = EchStatus::Offered;
+        }
         (EchStatus::NotOffered | EchStatus::Offered, Some(ech_state)) => {
             // Replace the client hello payload with an ECH client hello payload.
             chp_payload = ech_state.ech_hello(chp_payload, retryreq, &tls13_session)?;
@@ -482,6 +508,57 @@ fn emit_client_hello_for_retry(
         },
         payload: MessagePayload::handshake(chp),
     };
+
+    // Kirika fork: let the customizer reshape the hello, then record what was offered.
+    let ch = match config
+        .client_hello_customizer
+        .as_deref()
+    {
+        Some(customizer) => {
+            let context = ClientHelloContext {
+                retry: match (retryreq_encoded, input.sent_client_hello.as_deref()) {
+                    (Some(hello_retry_request), Some(first_client_hello)) => {
+                        Some(HelloRetryContext {
+                            hello_retry_request,
+                            first_client_hello,
+                        })
+                    }
+                    _ => None,
+                },
+                ech_outer: matches!(cx.data.ech_status, EchStatus::Offered | EchStatus::Rejected),
+                ech_grease: cx.data.ech_status == EchStatus::Grease,
+            };
+            let ech = match (ech_pending_inner, ech_state.as_mut()) {
+                (Some(encoded_inner_hello), Some(state)) => Some(PendingEchSeal {
+                    state,
+                    encoded_inner_hello,
+                }),
+                _ => None,
+            };
+            let ch = customize::apply(customizer, &ch, &context, ech)?;
+            if let MessagePayload::Handshake { parsed, encoded } = &ch.payload {
+                if retryreq.is_none() {
+                    input.sent_client_hello = Some(encoded.bytes().to_vec());
+                }
+                if let HandshakePayload::ClientHello(sent) = &parsed.0 {
+                    if ech_state.is_some() && cx.data.ech_status == EchStatus::Offered {
+                        input.prev_ech_ext = sent.encrypted_client_hello.clone();
+                    }
+                }
+            }
+            ch
+        }
+        None => ch,
+    };
+    if let MessagePayload::Handshake {
+        parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(sent)),
+        ..
+    } = &ch.payload
+    {
+        input
+            .hello
+            .record_sent(sent, &mut cx.data.sent_hello);
+    }
 
     if retryreq.is_some() {
         // send dummy CCS to fool middleboxes prior
@@ -886,15 +963,15 @@ impl ExpectServerHelloOrHelloRetryRequest {
         // retry of a group we already sent.
         let config = &self.next.input.config;
 
+        // Kirika fork: compare with the key shares actually sent.
         if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
-            let offered_hybrid = offered_key_share
-                .hybrid_component()
-                .and_then(|(group_name, _)| {
-                    config.find_kx_group(group_name, ProtocolVersion::TLSv1_3)
-                })
-                .map(|skxg| skxg.name());
-
-            if req_group == offered_key_share.group() || Some(req_group) == offered_hybrid {
+            if self
+                .next
+                .input
+                .hello
+                .sent_key_share_groups
+                .contains(&req_group)
+            {
                 return Err({
                     cx.common.send_fatal_alert(
                         AlertDescription::IllegalParameter,
@@ -964,7 +1041,16 @@ impl ExpectServerHelloOrHelloRetryRequest {
         }
 
         // Or asks us to use a ciphersuite we didn't offer.
-        let Some(cs) = config.find_cipher_suite(hrr.cipher_suite, cx.common.protocol) else {
+        let Some(cs) = config
+            .find_cipher_suite(hrr.cipher_suite, cx.common.protocol)
+            .filter(|_| {
+                self.next
+                    .input
+                    .hello
+                    .offered_cipher_suites
+                    .contains(&hrr.cipher_suite)
+            })
+        else {
             return Err({
                 cx.common.send_fatal_alert(
                     AlertDescription::IllegalParameter,
@@ -1022,7 +1108,16 @@ impl ExpectServerHelloOrHelloRetryRequest {
 
         let key_share = match hrr.key_share {
             Some(group) if group != offered_key_share.group() => {
-                let Some(skxg) = config.find_kx_group(group, ProtocolVersion::TLSv1_3) else {
+                let Some(skxg) = config
+                    .find_kx_group(group, ProtocolVersion::TLSv1_3)
+                    .filter(|_| {
+                        self.next
+                            .input
+                            .hello
+                            .offered_groups
+                            .contains(&group)
+                    })
+                else {
                     return Err(cx.common.send_fatal_alert(
                         AlertDescription::IllegalParameter,
                         PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedNamedGroup,
@@ -1035,9 +1130,15 @@ impl ExpectServerHelloOrHelloRetryRequest {
             _ => offered_key_share,
         };
 
+        let hrr_encoded = match &m.payload {
+            MessagePayload::Handshake { encoded, .. } => Some(encoded.bytes()),
+            _ => None,
+        };
+
         emit_client_hello_for_retry(
             transcript_buffer,
             Some(hrr),
+            hrr_encoded,
             Some(key_share),
             self.extra_exts,
             Some(cs),
@@ -1114,6 +1215,11 @@ impl ClientSessionValue {
         config: &ClientConfig,
         cx: &mut ClientContext<'_>,
     ) -> Option<persist::Retrieved<Self>> {
+        // Kirika fork: no resumption with a ClientHello customizer.
+        if config.client_hello_customizer.is_some() {
+            return None;
+        }
+
         let found = config
             .resumption
             .store

@@ -88,6 +88,11 @@ name = "bogo"
 path = "tests/bogo.rs"
 
 [[test]]
+name = "client_hello_customizer"
+path = "tests/client_hello_customizer.rs"
+required-features = ["aws_lc_rs"]
+
+[[test]]
 name = "client_cert_verifier"
 path = "tests/runners/client_cert_verifier.rs"
 
