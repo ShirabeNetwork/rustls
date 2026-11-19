@@ -78,6 +78,8 @@ pub(super) struct ClientHelloInput {
     pub(super) prev_ech_ext: Option<EncryptedClientHello>,
     /// The first ClientHello as sent, when a customizer is set (Kirika fork).
     pub(super) sent_client_hello: Option<Vec<u8>>,
+    /// Independent key share for the hybrid's component group (Kirika fork P2).
+    pub(super) independent_share: Option<Box<dyn ActiveKeyExchange>>,
 }
 
 impl ClientHelloInput {
@@ -139,6 +141,7 @@ impl ClientHelloInput {
             server_name,
             prev_ech_ext: None,
             sent_client_hello: None,
+            independent_share: None,
             config,
         })
     }
@@ -322,7 +325,28 @@ fn emit_client_hello_for_retry(
                             .is_some()
                     })
             {
-                shares.push(KeyShareEntry::new(component_group, component_share));
+                // Kirika fork P2: optionally a separate key pair for the component group.
+                let independent = config
+                    .client_hello_customizer
+                    .as_ref()
+                    .is_some_and(|c| c.independent_hybrid_component_share());
+                match (independent, input.independent_share.take()) {
+                    (true, Some(share)) => {
+                        shares.push(KeyShareEntry::new(share.group(), share.pub_key()));
+                        input.independent_share = Some(share);
+                    }
+                    (true, None) => {
+                        let share = config
+                            .find_kx_group(component_group, ProtocolVersion::TLSv1_3)
+                            .expect("filtered above")
+                            .start()?;
+                        shares.push(KeyShareEntry::new(share.group(), share.pub_key()));
+                        input.independent_share = Some(share);
+                    }
+                    (false, _) => {
+                        shares.push(KeyShareEntry::new(component_group, component_share));
+                    }
+                }
             }
         }
 
@@ -1129,6 +1153,11 @@ impl ExpectServerHelloOrHelloRetryRequest {
             }
             _ => offered_key_share,
         };
+
+        // Kirika fork P2: a HelloRetryRequest naming a group replaces all shares.
+        if hrr.key_share.is_some() {
+            self.next.input.independent_share = None;
+        }
 
         let hrr_encoded = match &m.payload {
             MessagePayload::Handshake { encoded, .. } => Some(encoded.bytes()),

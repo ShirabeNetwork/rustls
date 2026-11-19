@@ -269,6 +269,7 @@ struct Seen {
 #[derive(Debug)]
 struct TestCustomizer {
     mode: Mode,
+    independent: bool,
     calls: AtomicUsize,
     /// (rustls' hello, sent hello, retry context: (hrr, first hello)) per call.
     seen: Mutex<Vec<Seen>>,
@@ -278,6 +279,7 @@ impl TestCustomizer {
     fn new(mode: Mode) -> Arc<Self> {
         Arc::new(Self {
             mode,
+            independent: false,
             calls: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
         })
@@ -285,6 +287,10 @@ impl TestCustomizer {
 }
 
 impl ClientHelloCustomizer for TestCustomizer {
+    fn independent_hybrid_component_share(&self) -> bool {
+        self.independent
+    }
+
     fn customize(
         &self,
         context: &ClientHelloContext<'_>,
@@ -988,4 +994,76 @@ fn server_key_share_for_a_group_not_sent_is_refused() {
             Error::PeerMisbehaved(rustls::PeerMisbehaved::WrongGroupForKeyShare)
         );
     }
+}
+
+// --- P2: independent X25519 share ---
+
+#[test]
+fn independent_x25519_share() {
+    for independent in [false, true] {
+        for group in [
+            provider::kx_group::X25519,
+            provider::kx_group::X25519MLKEM768,
+        ] {
+            let mut config = client_config(default_client_kx());
+            let customizer = Arc::new(TestCustomizer {
+                mode: Mode::Greased,
+                independent,
+                calls: AtomicUsize::new(0),
+                seen: Mutex::new(Vec::new()),
+            });
+            config
+                .dangerous()
+                .set_client_hello_customizer(customizer.clone());
+            let mut client =
+                ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+            let mut server =
+                ServerConnection::new(Arc::new(server_config(all_tls13_suites(), vec![group])))
+                    .unwrap();
+            do_handshake(&mut client, &mut server);
+            round_trip(&mut client, &mut server);
+            assert_eq!(
+                client
+                    .negotiated_key_exchange_group()
+                    .unwrap()
+                    .name(),
+                group.name()
+            );
+
+            // rustls' own shares: X25519MLKEM768 = ML-KEM-768 key (1184) || X25519 key (32)
+            let ours = Hello::parse(&customizer.seen.lock().unwrap()[0].ours).key_shares();
+            assert_eq!(ours.len(), 2);
+            assert_eq!(ours[0].0, u16::from(NamedGroup::X25519MLKEM768));
+            assert_eq!(ours[1].0, u16::from(NamedGroup::X25519));
+            assert_eq!(ours[1].1.len(), 32);
+            let component = &ours[0].1[1184..];
+            assert_eq!(component == ours[1].1.as_slice(), !independent);
+        }
+    }
+}
+
+#[test]
+fn independent_share_is_replaced_after_hello_retry_request() {
+    let mut config = client_config(default_client_kx());
+    let customizer = Arc::new(TestCustomizer {
+        mode: Mode::Greased,
+        independent: true,
+        calls: AtomicUsize::new(0),
+        seen: Mutex::new(Vec::new()),
+    });
+    config
+        .dangerous()
+        .set_client_hello_customizer(customizer.clone());
+    let mut client = ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap();
+    let mut server = ServerConnection::new(Arc::new(server_config(
+        all_tls13_suites(),
+        vec![provider::kx_group::SECP256R1],
+    )))
+    .unwrap();
+    do_handshake(&mut client, &mut server);
+    round_trip(&mut client, &mut server);
+    let seen = customizer.seen.lock().unwrap();
+    let second = Hello::parse(&seen[1].ours).key_shares();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].0, u16::from(NamedGroup::secp256r1));
 }

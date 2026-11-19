@@ -61,6 +61,19 @@ pub trait ClientHelloCustomizer: fmt::Debug + Send + Sync {
         hello: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), Error>;
+
+    /// Send an independent key share for the classical component of a hybrid
+    /// group (fork patch P2).
+    ///
+    /// When the first key share is a hybrid group (e.g. `X25519MLKEM768`) whose
+    /// classical component group (e.g. `X25519`) is enabled separately, rustls
+    /// by default sends the hybrid's own component key as the second share.
+    /// When this returns `true`, rustls instead generates a separate key pair for
+    /// the component group with the provider (as browsers do) and uses it if the
+    /// server selects that group.  Defaults to `false`.
+    fn independent_hybrid_component_share(&self) -> bool {
+        false
+    }
 }
 
 /// Context passed to [`ClientHelloCustomizer::customize`].

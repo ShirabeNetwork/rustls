@@ -97,6 +97,7 @@ pub(super) fn handle_server_hello(
         mut sent_tls13_fake_ccs,
         mut hello,
         mut server_name,
+        independent_share,
         ..
     } = input;
 
@@ -116,7 +117,15 @@ pub(super) fn handle_server_hello(
                 .contains(&their_key_share.group)
         })
         .ok_or(())
-        .and_then(|_| KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share))
+        .and_then(|_| {
+            KeyExchangeChoice::new(
+                &config,
+                cx,
+                our_key_share,
+                independent_share,
+                their_key_share,
+            )
+        })
         .map_err(|_| {
             cx.common.send_fatal_alert(
                 AlertDescription::IllegalParameter,
@@ -265,10 +274,20 @@ impl KeyExchangeChoice {
         config: &Arc<ClientConfig>,
         cx: &mut ClientContext<'_>,
         our_key_share: Box<dyn ActiveKeyExchange>,
+        independent_share: Option<Box<dyn ActiveKeyExchange>>,
         their_key_share: &KeyShareEntry,
     ) -> Result<Self, ()> {
         if our_key_share.group() == their_key_share.group {
             return Ok(Self::Whole(our_key_share));
+        }
+
+        // Kirika fork P2: the server picked the independent component-group share.
+        if let Some(share) = independent_share.filter(|s| s.group() == their_key_share.group) {
+            let actual_skxg = config
+                .find_kx_group(share.group(), ProtocolVersion::TLSv1_3)
+                .ok_or(())?;
+            cx.common.kx_state = KxState::Start(actual_skxg);
+            return Ok(Self::Whole(share));
         }
 
         let (component_group, _) = our_key_share
